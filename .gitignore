@@ -1,0 +1,54 @@
+# ============================================================
+# TDMDO 專案 .gitignore
+# ============================================================
+
+# ---- 環境變數與機密 ----
+.env
+.env.*
+!.env.example
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ---- 資料庫 ----
+*.db
+*.sqlite3
+*.sqlite
+
+# ---- IDE / 編輯器 ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---- Claude Code 本地設定（含技能 .env 機密）----
+.claude/settings.local.json
+.claude/worktrees/
+.claude/skills/*/.env
+.claude/skills/*/downloads/
+
+# ---- Playwright MCP 工作階段殘留 ----
+.playwright-mcp/
+
+# ---- TDM 模組（獨立專案，不入此倉）----
+/TDM/
+
+# ---- 暫存 / 臨時檔案 ----
+Agent.md
+tmp/
+temp/
+*.tmp
+
+# ---- 日誌 ----
+*.log
+logs/

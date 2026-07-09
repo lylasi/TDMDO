@@ -1,0 +1,18 @@
+{
+    "defaultPrompt": "请详细描述这张图片的内容。",
+    "models": [
+      {
+        "name": "Grok Vision (主模型)",
+        "provider": "openai",
+        "providerId": "custom",
+        "model": "grok-4.20-fast",
+        "baseUrl": "https://hapi.141455.xyz/v1",
+        "apiKeyEnv": "VISION_API_KEY",
+        "apiKey": "",
+        "timeout": 60000
+      }
+    ],
+    "proxy": { "urls": [] },
+    "maxImageSize": 20971520,
+    "supportedFormats": ["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"]
+  }
