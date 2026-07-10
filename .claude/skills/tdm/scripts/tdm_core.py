@@ -883,19 +883,14 @@ def download_video(news_id: str = None, url: str = "",
     success = False
 
     if m3u8:
-        # 策略 1: yt-dlp 優先（無裁剪直下，有裁剪用 --download-sections）
-        if _HAS_YTDLP:
-            yt_cmd = _get_ytdlp_cmd() + ["--no-playlist", "-o", out]
-            if cut_start is not None and cut_dur is not None:
-                yt_cmd += ["--download-sections", f"*{cut_start}-{cut_start + cut_dur}"]
-            yt_cmd.append(m3u8)
+        # 策略 1: 無裁剪用 yt-dlp 直下（有裁剪直接 ffmpeg，確保精確到幀）
+        if _HAS_YTDLP and cut_start is None and cut_dur is None:
+            yt_cmd = _get_ytdlp_cmd() + ["--no-playlist", "-o", out, m3u8]
             if progress_callback:
                 progress_callback("📦 yt-dlp", 5, "$ " + " ".join(yt_cmd))
             success = _run_ytdlp(yt_cmd, progress_callback)
-            if not success and progress_callback:
-                progress_callback("📦 yt-dlp", 25, "yt-dlp 失敗，改用 ffmpeg")
 
-        # 策略 2: yt-dlp 失敗或不可用 → ffmpeg
+        # 策略 2: yt-dlp 失敗、不可用、或有裁剪 → ffmpeg
         if not success:
             ff_cmd = ["ffmpeg", "-y"]
             if cut_start is not None:
