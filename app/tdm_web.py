@@ -6,6 +6,7 @@ Web 層：只做 Flask 路由 + HTML UI，核心邏輯在 tdm_core.py。
 """
 
 import argparse
+import hashlib
 import os
 import re
 import sqlite3
@@ -39,6 +40,33 @@ except ImportError:
 
 app = Flask(__name__)
 _downloads: Dict[str, dict] = {}
+
+# ═══ 載入 .env 檔案（無相依套件）═══
+_ENV_DIR = Path(__file__).resolve().parent.parent / '.claude' / 'skills' / 'tdm'
+for _p in [_ENV_DIR / '.env', Path.cwd() / '.env']:
+    if _p.exists():
+        with open(str(_p), encoding='utf-8') as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if not _line or _line.startswith('#') or '=' not in _line:
+                    continue
+                _key, _val = _line.split('=', 1)
+                _key, _val = _key.strip(), _val.strip().strip('"\'')
+                if _key and _val:
+                    os.environ.setdefault(_key, _val)
+
+# ═══ Web 頁面密碼保護 ═══
+_AUTH_ENABLED = os.getenv("WEB_AUTH_ENABLED", "").lower() in ("1", "true", "yes")
+_AUTH_PASSWORDS_RAW = os.getenv("WEB_AUTH_PASSWORDS", "")
+_AUTH_TOKENS = set(
+    hashlib.sha256(p.strip().encode()).hexdigest()
+    for p in _AUTH_PASSWORDS_RAW.split(",")
+    if p.strip()
+) if _AUTH_PASSWORDS_RAW.strip() else set()
+
+if _AUTH_ENABLED and not _AUTH_TOKENS:
+    print("⚠️  WEB_AUTH_ENABLED=true 但未設定 WEB_AUTH_PASSWORDS，密碼保護不會生效")
+    _AUTH_ENABLED = False
 
 
 HTML = r"""<!DOCTYPE html>
@@ -115,6 +143,16 @@ label.check-label input[type=checkbox]{flex:none;width:auto}
 .ver-item .vz{color:var(--dim);font-size:.72rem;white-space:nowrap}
 #dl-cut-row{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;margin:.5rem 0}
 #dl-cut-row input{flex:1;min-width:90px;font-size:.8rem;padding:.45rem .55rem}
+/* 登入覆蓋層 */
+#auth-overlay{position:fixed;inset:0;z-index:99999;background:var(--bg);display:flex;align-items:center;justify-content:center}
+#auth-box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:2.5rem;width:360px;max-width:90vw;text-align:center}
+#auth-box h1{color:var(--accent);font-size:1.3rem;margin-bottom:.3rem}
+#auth-box p{color:var(--dim);font-size:.85rem;margin-bottom:1.5rem}
+#auth-box input{width:100%;margin-bottom:.75rem;text-align:center;font-size:1rem;padding:.75rem;letter-spacing:.15em}
+#auth-box button{width:100%;padding:.75rem;font-size:.95rem}
+#auth-err{color:var(--err);font-size:.8rem;margin-top:.5rem;display:none}
+#auth-box .hint{color:var(--dim);font-size:.7rem;margin-top:1rem;opacity:.5}
+#auth-box.loading button{opacity:.6;pointer-events:none}
 @media(max-width:768px){
   main{padding:.75rem}
   header{padding:.5rem .75rem;flex-wrap:wrap}
@@ -130,6 +168,17 @@ label.check-label input[type=checkbox]{flex:none;width:auto}
 </style>
 </head>
 <body>
+<!-- 登入覆蓋層 -->
+<div id="auth-overlay" style="display:none">
+  <div id="auth-box">
+    <h1>🔐 TDMDO</h1>
+    <p>請輸入密碼以繼續</p>
+    <input type="password" id="auth-pwd" placeholder="輸入密碼..." autocomplete="current-password" onkeydown="if(event.key==='Enter')doAuth()" autofocus>
+    <button onclick="doAuth()">解鎖</button>
+    <div id="auth-err">❌ 密碼錯誤，請重試</div>
+    <div class="hint"></div>
+  </div>
+</div>
 <header>
   <h1>📡 TDMDO</h1>
   <nav>
@@ -241,6 +290,12 @@ label.check-label input[type=checkbox]{flex:none;width:auto}
 
 <script>
 const S=id=>document.getElementById(id);
+// ── 密碼認證 ──
+const _AUTH_OVERLAY=S('auth-overlay'),_AUTH_ERR=S('auth-err'),_AUTH_PWD=S('auth-pwd');
+let _authOk=false;
+async function initAuth(){try{const r=await fetch('/api/auth-check');const d=await r.json();if(!d.enabled)return;_authOk=d.ok;if(!d.ok){_AUTH_OVERLAY.style.display='flex';setTimeout(()=>_AUTH_PWD.focus(),100)}}catch(e){}}
+async function doAuth(){const pwd=_AUTH_PWD.value;if(!pwd)return;_AUTH_ERR.style.display='none';document.getElementById('auth-box').classList.add('loading');try{const r=await fetch('/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd})});const d=await r.json();if(d.ok){_AUTH_OVERLAY.style.display='none';_authOk=true}else{_AUTH_ERR.style.display='block';_AUTH_PWD.value='';_AUTH_PWD.focus()}}catch(e){_AUTH_ERR.textContent='❌ 網路錯誤';_AUTH_ERR.style.display='block'}document.getElementById('auth-box').classList.remove('loading')}
+initAuth();
 let newsPage=1,newsTotal=0,dlTimer=null,searchKW='',currentVideoInfo=null,activeVOsearch=false,_hls=null;
 
 // ── Tab ──
@@ -1044,13 +1099,61 @@ def api_delete_video_by_id(video_id):
     return jsonify({"ok": True})
 
 
+# ═══ 密碼保護路由 ═══
+
+@app.route("/api/auth-check")
+def api_auth_check():
+    """檢查 Cookie 是否包含有效的認證 token。"""
+    if not _AUTH_ENABLED:
+        return jsonify({"ok": True, "enabled": False})
+    token = request.cookies.get("tdmdo_auth", "")
+    ok = token in _AUTH_TOKENS
+    return jsonify({"ok": ok, "enabled": True})
+
+
+@app.route("/auth", methods=["POST"])
+def api_auth_login():
+    """驗證密碼，設置認證 Cookie。"""
+    if not _AUTH_PASSWORDS_RAW.strip():
+        return jsonify({"ok": False, "error": "未設定密碼"}), 403
+
+    data = request.get_json(silent=True) or {}
+    password = data.get("password", "")
+    token = hashlib.sha256(password.encode()).hexdigest()
+
+    if token in _AUTH_TOKENS:
+        resp = jsonify({"ok": True})
+        resp.set_cookie(
+            "tdmdo_auth", token,
+            max_age=30 * 24 * 3600,   # 30 天
+            httponly=True,
+            samesite="Lax",
+            # secure=True  # 若需 HTTPS 可取消註釋
+        )
+        return resp
+    return jsonify({"ok": False, "error": "密碼錯誤"}), 401
+
+
+@app.route("/auth/logout", methods=["POST"])
+def api_auth_logout():
+    """清除認證 Cookie。"""
+    resp = jsonify({"ok": True})
+    resp.delete_cookie("tdmdo_auth", path="/")
+    return resp
+
+
 # ─── main ─────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="TDMDO 網頁端")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--host", default="0.0.0.0")
     args = parser.parse_args()
-    print(f"\n  TDMDO  http://{args.host}:{args.port}\n  下載目錄: {DOWNLOAD_DIR}\n")
+    print(f"\n  TDMDO  http://{args.host}:{args.port}\n  下載目錄: {DOWNLOAD_DIR}")
+    if _AUTH_ENABLED:
+        print(f"  [AUTH] 密碼保護: 啟用 (密碼數: {len(_AUTH_TOKENS)})")
+    else:
+        print(f"  [AUTH] 密碼保護: 關閉")
+    print()
     app.run(host=args.host, port=args.port, debug=False)
 
 if __name__ == "__main__":
