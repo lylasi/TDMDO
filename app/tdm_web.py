@@ -7,6 +7,7 @@ Web 層：只做 Flask 路由 + HTML UI，核心邏輯在 tdm_core.py。
 
 import argparse
 import hashlib
+import math
 import os
 import re
 import sqlite3
@@ -30,6 +31,7 @@ from tdm_core import (
     get_pushed_filenames, list_videos,
     get_videos_by_news_id, get_grouped_videos, get_video_by_id,
     push_to_channels, is_push_available,
+    get_db_stats, get_push_log, sync_latest_news,
 )
 
 try:
@@ -750,6 +752,146 @@ function fmtSize(b){if(!b||b===0)return'';const kb=b/1024;return kb>=1024?`${(kb
 </html>"""
 
 
+AUTH_HTML = r"""<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>TDMDO — 登入</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--fg:#c9d1d9;--accent:#f0c040;--dim:#8b949e;--err:#f5a5a5}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--fg);font-family:"Microsoft JhengHei","PingFang TC",sans-serif}
+#box{width:360px;max-width:90vw;padding:2.5rem;background:var(--card);border:1px solid var(--border);border-radius:12px;text-align:center}
+h1{margin:0 0 .3rem;color:var(--accent);font-size:1.3rem}p{margin:0 0 1.5rem;color:var(--dim);font-size:.85rem}
+input,button{width:100%;padding:.75rem;border-radius:6px;font-size:1rem}input{margin-bottom:.75rem;background:var(--bg);border:1px solid var(--border);color:var(--fg);text-align:center}button{border:0;background:var(--accent);color:var(--bg);font-weight:600;cursor:pointer}#err{display:none;margin-top:.6rem;color:var(--err);font-size:.8rem}
+</style>
+</head>
+<body><div id="box"><h1>TDMDO</h1><p>請輸入密碼以繼續</p><input id="pwd" type="password" autocomplete="current-password" autofocus><button id="btn" onclick="login()">解鎖</button><div id="err"></div></div>
+<script>
+const pwd=document.getElementById('pwd'),btn=document.getElementById('btn'),err=document.getElementById('err');
+pwd.addEventListener('keydown',e=>{if(e.key==='Enter')login()});
+async function login(){if(!pwd.value)return;btn.disabled=true;err.style.display='none';try{const r=await fetch('/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd.value})});const d=await r.json();if(r.ok&&d.ok){location.reload();return}err.textContent=d.error||'密碼錯誤';err.style.display='block';pwd.value='';pwd.focus()}catch(e){err.textContent='網路錯誤';err.style.display='block'}finally{btn.disabled=false}}
+</script></body></html>"""
+
+
+def _json_object():
+    """取得 JSON object；格式錯誤時回傳可直接使用的 400 response。"""
+    data = request.get_json(silent=True)
+    if data is None:
+        return {}, None
+    if not isinstance(data, dict):
+        return None, (jsonify({"error": "JSON 內容必須是物件"}), 400)
+    return data, None
+
+
+def _text_value(data, name, default="", required=False):
+    value = data.get(name, default)
+    if value is None:
+        value = default
+    if not isinstance(value, str):
+        raise ValueError(f"{name} 必須是字串")
+    value = value.strip()
+    if required and not value:
+        raise ValueError(f"請提供 {name}")
+    return value
+
+
+def _time_value(data, name):
+    value = data.get(name, "")
+    if value is None or value == "":
+        return "", None
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError(f"{name} 必須是有效時間")
+    text = str(value).strip()
+    if not text:
+        return "", None
+    seconds = parse_time(text)
+    if not math.isfinite(seconds):
+        raise ValueError(f"{name} 必須是有限數值")
+    return text, seconds
+
+
+def _positive_int(value, name, default=None, maximum=None):
+    if value is None or value == "":
+        if default is None:
+            raise ValueError(f"請提供 {name}")
+        return default
+    if isinstance(value, bool):
+        raise ValueError(f"{name} 必須是正整數")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} 必須是正整數")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"{name} 必須是正整數")
+    if isinstance(value, str) and str(parsed) != value.strip().lstrip("+"):
+        raise ValueError(f"{name} 必須是正整數")
+    if parsed <= 0 or (maximum is not None and parsed > maximum):
+        limit = f"且不可大於 {maximum}" if maximum is not None else ""
+        raise ValueError(f"{name} 必須大於 0{limit}")
+    return parsed
+
+
+def _bool_value(value, name, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes"):
+            return True
+        if lowered in ("0", "false", "no", ""):
+            return False
+    raise ValueError(f"{name} 必須是布林值")
+
+
+def _download_output(value, default_name):
+    """只允許 DOWNLOAD_DIR 直屬檔案，避免任意路徑寫入。"""
+    if value is None or value == "":
+        candidate = DOWNLOAD_DIR / default_name
+    else:
+        if not isinstance(value, str):
+            raise ValueError("output 必須是檔名")
+        raw = Path(value.strip())
+        if not value.strip() or raw.name in ("", ".", ".."):
+            raise ValueError("output 必須是有效檔名")
+        candidate = raw if raw.is_absolute() else DOWNLOAD_DIR / raw
+
+    base = DOWNLOAD_DIR.resolve()
+    resolved = candidate.resolve()
+    if resolved.parent != base or len(resolved.name) > 255:
+        raise ValueError("output 只能是下載目錄內的檔名")
+    return resolved
+
+
+def _core_error_status(error):
+    message = str(error or "")
+    if "需要 ffmpeg" in message or "不可用" in message:
+        return 503
+    if "找不到" in message or "不存在" in message:
+        return 404
+    if any(text in message for text in ("無法解析時間", "持續時間", "需要 --end", "必須")):
+        return 400
+    return 500
+
+
+@app.before_request
+def enforce_web_auth():
+    """由 Flask 後端保護業務頁與 API，不依賴前端覆蓋層。"""
+    if not _AUTH_ENABLED:
+        return None
+    if request.path in ("/auth", "/auth/logout", "/api/auth-check"):
+        return None
+    if request.endpoint == "static" or request.path.startswith("/static/"):
+        return None
+    if request.cookies.get("tdmdo_auth", "") in _AUTH_TOKENS:
+        return None
+    if request.path.startswith("/api/") or request.method != "GET":
+        return jsonify({"ok": False, "error": "未登入"}), 401
+    return render_template_string(AUTH_HTML), 401
+
 
 # ═══════════════════════════════════════════════════════════
 # Routes
@@ -761,8 +903,11 @@ def index(): return render_template_string(HTML)
 # ── 新聞 API ─────────────────────────────────────────────
 @app.route("/api/news")
 def api_news():
-    page = int(request.args.get("page", 1))
-    size = int(request.args.get("size", 15))
+    try:
+        page = _positive_int(request.args.get("page"), "page", default=1)
+        size = _positive_int(request.args.get("size"), "size", default=15, maximum=100)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     search = request.args.get("search", "").strip()
     stype = request.args.get("stype", "search_news")
     vo = request.args.get("video_only", "0") == "1"
@@ -795,14 +940,17 @@ def api_news():
 # ── 影片查詢 API ─────────────────────────────────────────
 @app.route("/api/query-video", methods=["POST"])
 def api_query_video():
-    data = request.get_json(silent=True) or {}
-    inp = data.get("input", "").strip()
-    if not inp:
-        return jsonify({"error": "請輸入 TDM URL 或 ID"})
+    data, error = _json_object()
+    if error:
+        return error
+    try:
+        inp = _text_value(data, "input", required=True)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
     nid = extract_id(inp)
     if not nid:
-        return jsonify({"error": "無法解析 ID"})
+        return jsonify({"error": "無法解析 ID"}), 400
 
     info = get_video_info(nid)
     if not info or not info.get("m3u8"):
@@ -835,14 +983,31 @@ def api_query_video():
 # ── 下載 API ─────────────────────────────────────────────
 @app.route("/api/download", methods=["POST"])
 def api_download():
-    data = request.get_json(silent=True) or {}
-    url = data.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "請提供 URL"}), 400
+    data, error = _json_object()
+    if error:
+        return error
+    try:
+        url = _text_value(data, "url", required=True)
+        cut_start, cs_sec = _time_value(data, "cut_start")
+        cut_end, ce_sec = _time_value(data, "cut_end")
+        cut_duration, cd_sec = _time_value(data, "cut_duration")
+        overwrite = _bool_value(data.get("overwrite"), "overwrite", False)
+        push_enabled = _bool_value(data.get("push"), "push", False)
+        push_target = _text_value(data, "push_target", default="") or None
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    if cut_end and cut_duration:
+        return jsonify({"error": "cut_end 與 cut_duration 只能擇一"}), 400
+    if cs_sec is not None and cs_sec < 0:
+        return jsonify({"error": "cut_start 不可小於 0"}), 400
+    start_sec = cs_sec if cs_sec is not None else 0.0
+    if ce_sec is not None and ce_sec <= start_sec:
+        return jsonify({"error": "cut_end 必須大於 cut_start"}), 400
+    if cd_sec is not None and cd_sec <= 0:
+        return jsonify({"error": "cut_duration 必須大於 0"}), 400
 
     nid = extract_id(url)
-    cut_start = data.get("cut_start", "").strip()
-    cut_end = data.get("cut_end", "").strip()
 
     # 先查影片資訊
     title = "video"
@@ -854,29 +1019,34 @@ def api_download():
             length = float(info.get("length") or 0)
             if not info.get("m3u8"):
                 return jsonify({"error": f"不含影片: {title}"}), 400
+    if cut_start and not (cut_end or cut_duration) and length and start_sec >= length:
+        return jsonify({"error": "cut_start 必須小於影片長度"}), 400
 
-    # 解析裁剪
-    cs_sec = None
-    ce_sec = None
-    try:
-        if cut_start: cs_sec = parse_time(cut_start)
-        if cut_end: ce_sec = parse_time(cut_end)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    cut_dur = (ce_sec - cs_sec) if (cs_sec is not None and ce_sec is not None) else None
+    cut_dur = cd_sec
+    effective_end = None
+    if ce_sec is not None:
+        cut_dur = ce_sec - start_sec
+        effective_end = ce_sec
+    elif cd_sec is not None:
+        effective_end = start_sec + cd_sec
 
-    # 產出檔名
+    # 產出檔名；自訂 output 也只能位於下載目錄直屬層級。
     safe = safe_filename(title)
     suffix = ""
-    if cut_start or cut_end:
-        s1 = fmt_cut_time(cs_sec or 0)
-        s2 = fmt_cut_time(ce_sec) if cut_end else "end"
+    if cut_start or cut_end or cut_duration:
+        s1 = fmt_cut_time(start_sec)
+        s2 = fmt_cut_time(effective_end) if effective_end is not None else "end"
         suffix = f"_cut_{s1}_{s2}"
-    out = str(DOWNLOAD_DIR / f"{nid or 'video'}_{safe}{suffix}.mp4")
+    default_name = f"{nid or 'video'}_{safe}{suffix}.mp4"
+    try:
+        out_path = _download_output(data.get("output"), default_name)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    out = str(out_path)
 
-    if Path(out).exists() and not data.get("overwrite"):
-        size_mb = Path(out).stat().st_size / (1024 * 1024)
-        return jsonify({"error": f"檔案已存在: {Path(out).name} ({size_mb:.1f} MB)"}), 409
+    if out_path.exists() and not overwrite:
+        size_mb = out_path.stat().st_size / (1024 * 1024)
+        return jsonify({"error": f"檔案已存在: {out_path.name} ({size_mb:.1f} MB)"}), 409
 
     dl_id = str(uuid.uuid4())[:8]
     _downloads[dl_id] = {
@@ -893,19 +1063,25 @@ def api_download():
                 d["log"].append(line)
 
     def _run():
-        result = download_video(
-            news_id=nid, url=url,
-            cut_start=cs_sec, cut_dur=cut_dur,
-            output=out, overwrite=data.get("overwrite", False),
-            download_method="web",
-            progress_callback=_progress,
-        )
+        try:
+            result = download_video(
+                news_id=nid, url=url,
+                cut_start=start_sec if (cut_start or cut_end or cut_duration) else None,
+                cut_dur=cut_dur,
+                output=out, overwrite=overwrite,
+                download_method="web",
+                push_enabled=push_enabled,
+                push_targets=push_target,
+                progress_callback=_progress,
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
         d = _downloads.get(dl_id)
         if d:
-            if result["ok"]:
-                d["status"] = f"完成: {result['title']}"
+            if result.get("ok"):
+                d["status"] = f"完成: {result.get('title', title)}"
                 d["pct"] = 100; d["done"] = True; d["ok"] = True
-                d["filename"] = result["filename"]
+                d["filename"] = result.get("filename", out_path.name)
             else:
                 d["status"] = "失敗"
                 d["done"] = True; d["ok"] = False
@@ -913,8 +1089,9 @@ def api_download():
 
     threading.Thread(target=_run, daemon=True).start()
     label = title
-    if cut_start or cut_end:
-        label += f" (裁剪 {cut_start or '0'}->{cut_end or '尾'})"
+    if cut_start or cut_end or cut_duration:
+        endpoint = cut_end or (f"+{cut_duration}" if cut_duration else "尾")
+        label += f" (裁剪 {cut_start or '0'}->{endpoint})"
     return jsonify({"download_id": dl_id, "info": f"{label} ({length}s)"})
 
 
@@ -927,29 +1104,63 @@ def api_progress(dl_id):
 # ── 裁剪 API ─────────────────────────────────────────────
 @app.route("/api/trim", methods=["POST"])
 def api_trim():
-    data = request.get_json(silent=True) or {}
-    fname = data.get("file", "").strip()
-    start = data.get("start", "").strip()
-    end = data.get("end", "").strip()
-    if not fname or not start:
-        return jsonify({"error": "請提供檔案名和開始時間"}), 400
+    data, error = _json_object()
+    if error:
+        return error
+    try:
+        fname = _text_value(data, "file", required=True)
+        start, start_sec = _time_value(data, "start")
+        end, end_sec = _time_value(data, "end")
+        duration, duration_sec = _time_value(data, "duration")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    if not start:
+        return jsonify({"error": "請提供 start"}), 400
+    if bool(end) == bool(duration):
+        return jsonify({"error": "end 與 duration 必須擇一提供"}), 400
+    if start_sec is not None and start_sec < 0:
+        return jsonify({"error": "start 不可小於 0"}), 400
+    if end_sec is not None and end_sec <= start_sec:
+        return jsonify({"error": "end 必須大於 start"}), 400
+    if duration_sec is not None and duration_sec <= 0:
+        return jsonify({"error": "duration 必須大於 0"}), 400
 
     inp = DOWNLOAD_DIR / Path(fname).name
-    if not inp.exists():
+    if not inp.is_file():
         return jsonify({"error": f"找不到: {Path(fname).name}"}), 404
+
+    output_path = None
+    if data.get("output") not in (None, ""):
+        try:
+            output_path = _download_output(data.get("output"), "unused.mp4")
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
 
     # 嘗試從檔名解析 news_id
     nid_match = re.match(r'^(\d{6,7})_', Path(fname).name)
     nid = nid_match.group(1) if nid_match else None
 
-    result = trim_video(str(inp), start, end=end if end else None,
-                        output_dir=DOWNLOAD_DIR, push_enabled=True,
-                        news_id=nid)
-    if result["ok"]:
+    try:
+        result = trim_video(
+            str(inp), start,
+            end=end or None,
+            duration=duration or None,
+            output=str(output_path) if output_path else None,
+            output_dir=DOWNLOAD_DIR,
+            push_enabled=True,
+            news_id=nid,
+        )
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    if result.get("ok"):
         return jsonify({"ok": True, "filename": result["filename"],
                         "push_ok": result.get("push_ok", False)})
-    else:
-        return jsonify({"ok": False, "error": result["error"]})
+    message = result.get("error", "裁剪失敗")
+    return jsonify({"ok": False, "error": message}), _core_error_status(message)
 
 
 # ── 影片管理 API ─────────────────────────────────────────
@@ -979,27 +1190,32 @@ def api_video_by_id(video_id):
 
 @app.route("/api/push-to-webdav", methods=["POST"])
 def api_push_to_webdav():
+    data, error = _json_object()
+    if error:
+        return error
+    try:
+        raw_video_id = data.get("video_id")
+        video_id = _positive_int(raw_video_id, "video_id") if raw_video_id not in (None, "") else None
+        filename = _text_value(data, "filename", default="")
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    if video_id is None and not filename:
+        return jsonify({"ok": False, "error": "請提供 video_id 或 filename"}), 400
     if not is_webdav_configured():
-        return jsonify({"ok": False, "error": "WebDAV 未啟用或配置不完整"})
-
-    data = request.get_json() or {}
-    video_id = data.get("video_id")
-    filename = data.get("filename", "")
+        return jsonify({"ok": False, "error": "WebDAV 未啟用或配置不完整"}), 503
 
     # 優先從 video_id 查檔案路徑
-    if video_id:
+    if video_id is not None:
         init_db()
-        v = get_video_by_id(int(video_id))
+        v = get_video_by_id(video_id)
         if v and v.get("filepath"):
             fp = Path(v["filepath"])
         else:
-            return jsonify({"ok": False, "error": f"video_id={video_id} 找不到"})
-    elif filename:
-        fp = DOWNLOAD_DIR / Path(filename).name
-        if not fp.exists():
-            return jsonify({"ok": False, "error": f"檔案不存在: {filename}"})
+            return jsonify({"ok": False, "error": f"video_id={video_id} 找不到"}), 404
     else:
-        return jsonify({"ok": False, "error": "請提供 video_id 或 filename"})
+        fp = DOWNLOAD_DIR / Path(filename).name
+    if not fp.is_file():
+        return jsonify({"ok": False, "error": f"檔案不存在: {fp.name}"}), 404
 
     init_db()
     ok = push_to_webdav(str(fp))
@@ -1016,30 +1232,36 @@ def api_push_to_webdav():
 
 @app.route("/api/push-to-tg", methods=["POST"])
 def api_push_to_tg():
+    data, error = _json_object()
+    if error:
+        return error
+    try:
+        raw_video_id = data.get("video_id")
+        video_id = _positive_int(raw_video_id, "video_id") if raw_video_id not in (None, "") else None
+        filename = _text_value(data, "filename", default="")
+        caption = _text_value(data, "caption", default="")
+        target = _text_value(data, "target", default="") or None
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    if video_id is None and not filename:
+        return jsonify({"ok": False, "error": "請提供 video_id 或 filename"}), 400
     if not is_push_available():
-        return jsonify({"ok": False, "error": "Telegram 推送不可用。請檢查 TG_TOKEN / TG_CHATID 配置及 python-telegram-bot 是否已安裝"})
+        return jsonify({"ok": False, "error": "Telegram 推送不可用。請檢查 TG_TOKEN / TG_CHATID 配置及 python-telegram-bot 是否已安裝"}), 503
 
-    data = request.get_json() or {}
-    video_id = data.get("video_id")
-    filename = data.get("filename", "")
-
-    if video_id:
+    if video_id is not None:
         init_db()
-        v = get_video_by_id(int(video_id))
+        v = get_video_by_id(video_id)
         if v and v.get("filepath"):
             fp = Path(v["filepath"])
         else:
-            return jsonify({"ok": False, "error": f"video_id={video_id} 找不到"})
-    elif filename:
-        fp = DOWNLOAD_DIR / Path(filename).name
-        if not fp.exists():
-            return jsonify({"ok": False, "error": f"檔案不存在: {filename}"})
+            return jsonify({"ok": False, "error": f"video_id={video_id} 找不到"}), 404
     else:
-        return jsonify({"ok": False, "error": "請提供 video_id 或 filename"})
+        fp = DOWNLOAD_DIR / Path(filename).name
+    if not fp.is_file():
+        return jsonify({"ok": False, "error": f"檔案不存在: {fp.name}"}), 404
 
     init_db()
-    caption = fp.stem
-    results = push_to_channels(str(fp), caption)
+    results = push_to_channels(str(fp), caption or fp.stem, target)
 
     all_ok = True
     details = []
@@ -1074,9 +1296,11 @@ def api_download_file(filename):
 
 @app.route("/api/delete-video/<path:filename>", methods=["DELETE"])
 def api_delete_video(filename):
-    # 支援 video_id 查詢：/api/delete-video/vid/123
-    # 兼容舊 filename 路徑
-    pass
+    """舊 filename 刪除路由已停用；改用資料庫主鍵避免同名或路徑誤刪。"""
+    return jsonify({
+        "ok": False,
+        "error": "此舊路由已停用，請改用 /api/delete-video-by-id/<video_id>",
+    }), 410
 
 
 @app.route("/api/delete-video-by-id/<int:video_id>", methods=["DELETE"])
@@ -1085,18 +1309,98 @@ def api_delete_video_by_id(video_id):
     v = get_video_by_id(video_id)
     if not v:
         return jsonify({"ok": False, "error": "找不到記錄"}), 404
-    fp = Path(v.get("filepath", ""))
-    if fp.exists():
-        fp.unlink()
+
+    filepath = v.get("filepath")
+    if filepath:
+        fp = Path(filepath)
+        if fp.is_file():
+            try:
+                fp.unlink()
+            except OSError as e:
+                return jsonify({"ok": False, "error": f"刪除檔案失敗: {e}"}), 500
+
     # 從 videos 表移除
+    conn = None
     try:
         conn = sqlite3.connect(str(DB_PATH))
         conn.execute("DELETE FROM videos WHERE id = ?", (video_id,))
         conn.commit()
-        conn.close()
-    except Exception:
-        pass
+    except sqlite3.Error as e:
+        return jsonify({"ok": False, "error": f"刪除記錄失敗: {e}"}), 500
+    finally:
+        if conn is not None:
+            conn.close()
     return jsonify({"ok": True})
+
+
+# ═══ 遠端 CLI 新增端點 ═══════════════════════════════════
+
+@app.route("/api/db-stats")
+def api_db_stats():
+    """遠端 CLI：資料庫統計。"""
+    init_db()
+    s = get_db_stats()
+    s["db_path"] = str(DB_PATH)
+    return jsonify(s)
+
+
+@app.route("/api/db-sync", methods=["POST"])
+def api_db_sync():
+    """遠端 CLI：觸發資料庫同步。"""
+    data = request.get_json(silent=True) or {}
+    init_db()
+    try:
+        n = sync_latest_news(
+            force_update=data.get("force", False),
+            pages=data.get("pages", 3),
+            all_days=data.get("all_days", False),
+        )
+        return jsonify({"ok": True, "count": n})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/push-log")
+def api_push_log():
+    """遠端 CLI：查看推送記錄（WebDAV）。"""
+    try:
+        limit = _positive_int(request.args.get("limit"), "limit", default=20, maximum=1000)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    init_db()
+    rows = get_push_log(limit)
+    return jsonify({"rows": rows})
+
+
+@app.route("/api/push-text", methods=["POST"])
+def api_push_text():
+    """遠端 CLI：純文字推送。"""
+    data, error = _json_object()
+    if error:
+        return error
+    try:
+        text = _text_value(data, "text", required=True)
+        target = _text_value(data, "target", default="") or None
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    if not is_push_available():
+        return jsonify({"ok": False, "error": "推送功能不可用"}), 503
+
+    results = push_to_channels("", text, target)
+    all_ok = True
+    details = []
+    for ch_name, r in results.items():
+        if r.get("success"):
+            details.append(f"[{ch_name}] OK: {r.get('message', '')}")
+        else:
+            all_ok = False
+            details.append(f"[{ch_name}] FAIL: {r.get('error', '')}")
+
+    return jsonify({
+        "ok": all_ok,
+        "detail": "; ".join(details),
+        "error": "" if all_ok else "; ".join(details),
+    })
 
 
 # ═══ 密碼保護路由 ═══
@@ -1114,11 +1418,16 @@ def api_auth_check():
 @app.route("/auth", methods=["POST"])
 def api_auth_login():
     """驗證密碼，設置認證 Cookie。"""
+    data, error = _json_object()
+    if error:
+        return error
+    try:
+        password = _text_value(data, "password", required=True)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
     if not _AUTH_PASSWORDS_RAW.strip():
         return jsonify({"ok": False, "error": "未設定密碼"}), 403
 
-    data = request.get_json(silent=True) or {}
-    password = data.get("password", "")
     token = hashlib.sha256(password.encode()).hexdigest()
 
     if token in _AUTH_TOKENS:

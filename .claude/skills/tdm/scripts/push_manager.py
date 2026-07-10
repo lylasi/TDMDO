@@ -30,12 +30,27 @@ Push Manager — 通用推送模組（CLI & API 雙用）
   python push_manager.py --image photo.jpg --caption "截圖"
 """
 
+import io
 import os
 import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional, Dict, List, Union
 from dataclasses import dataclass
+
+# ── Windows 終端 UTF-8（避免 CP950 無法輸出狀態符號）──
+def _ensure_utf8_stream(stream):
+    encoding = (getattr(stream, "encoding", "") or "").lower().replace("-", "")
+    if encoding == "utf8" or not hasattr(stream, "buffer"):
+        return stream
+    return io.TextIOWrapper(stream.buffer, encoding="utf-8", errors="replace")
+
+
+try:
+    sys.stdout = _ensure_utf8_stream(sys.stdout)
+    sys.stderr = _ensure_utf8_stream(sys.stderr)
+except Exception:
+    pass
 
 # ── .env 載入（相容 CLI & 模組導入）──
 _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"

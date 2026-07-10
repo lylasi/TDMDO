@@ -308,6 +308,104 @@ python .claude/skills/tdm/scripts/tdm_tool.py push-log --limit 20
 
 ---
 
+## 🌐 遠端模式（多機共用一台 Server）
+
+設定 `TDM_SERVER` 後，CLI 所有操作自動走 HTTP 調用遠端 Flask 伺服器。客戶端**只需 `pip install requests`**，不需要 SQLite / ffmpeg / flask。
+
+### 架構
+
+```
+┌─────────────────────┐
+│ Server 機（常駐）     │
+│ flask + ffmpeg       │
+│ + SQLite + 影片儲存   │  ← 所有重裝備都在這裡
+└────────┬────────────┘
+         │ HTTP API (:8080)
+    ┌────┴────┬────────┐
+    │         │        │
+┌───┴──┐ ┌───┴──┐ ┌───┴──┐
+│ A 機  │ │ B 機  │ │ C 機  │  ← 只有 requests
+└──────┘ └──────┘ └──────┘
+```
+
+### 使用方法
+
+**步驟 1** — Server 機啟動 Web 服務：
+
+```bash
+python app/tdm_web.py --host 0.0.0.0 --port 8080
+```
+
+**步驟 2** — 客戶端設定遠端伺服器（二選一）：
+
+```bash
+# 方式一：環境變數（永久生效，寫在 .env）
+TDM_SERVER=http://192.168.1.100:8080
+
+# 方式二：命令列參數（一次性）
+python .claude/skills/tdm/scripts/tdm_tool.py --server http://192.168.1.100:8080 news --limit 10
+```
+
+**步驟 3** — 照常使用所有 CLI 命令：
+
+```bash
+# 查詢新聞（走遠端）
+python .claude/skills/tdm/scripts/tdm_tool.py news --video-only --limit 10
+
+# 搜尋新聞
+python .claude/skills/tdm/scripts/tdm_tool.py search "颱風" --video-only
+
+# 下載影片（由 Server 機執行 ffmpeg，完成後提供下載連結）
+python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791
+
+# 裁剪影片（Server 機上已有檔案）
+python .claude/skills/tdm/scripts/tdm_tool.py trim --input 1217791_新聞.mp4 --start 00:00:20 --end 00:00:50
+
+# 查看遠端資料庫統計
+python .claude/skills/tdm/scripts/tdm_tool.py db stats
+
+# 觸發遠端同步
+python .claude/skills/tdm/scripts/tdm_tool.py db sync --all-days --pages 5
+
+# 推送文字到 Telegram（透過 Server 機）
+python .claude/skills/tdm/scripts/tdm_tool.py push --text "下載完成"
+```
+
+### 遠端模式支援的命令
+
+| 命令 | 遠端行為 | 備註 |
+|---|---|---|
+| `news` | HTTP GET `/api/news` | 完整支援參數 |
+| `search` | HTTP GET `/api/news?search=` | 完整支援參數 |
+| `download` | HTTP POST `/api/download` + 輪詢進度 | 影片儲存在 Server 機 |
+| `trim` | HTTP POST `/api/trim` | 針對 Server 機既有檔案 |
+| `push` | HTTP POST `/api/push-text` 或 `/api/push-to-tg` | 透過 Server 機推送 |
+| `db stats` | HTTP GET `/api/db-stats` | |
+| `db sync` | HTTP POST `/api/db-sync` | 觸發 Server 機同步 |
+| `push-log` | HTTP GET `/api/push-log` | |
+| `db init` | ⚠️ 不支援（由 Server 端管理） | 顯示提示訊息 |
+
+> **注意**：遠端模式下 `download` / `trim` 的影片儲存在 Server 機的 `TDM_DOWNLOAD_DIR`，完成後終端會顯示下載連結。
+
+### 遠端模式的 .env 配置
+
+在客戶端的 `.env` 中只需設定：
+
+```env
+# 遠端伺服器 URL
+TDM_SERVER=http://192.168.1.100:8080
+
+# Server 啟用 WEB_AUTH_ENABLED 時，CLI 自動登入使用
+TDM_SERVER_PASSWORD=your_server_password
+
+# 遠端下載進度輪詢總逾時秒數
+TDM_REMOTE_POLL_TIMEOUT=600
+```
+
+Server 機的 `.env` 保持原有完整配置即可（Telegram / WebDAV / Web 密碼保護等）。若啟用密碼保護，建議只在 HTTPS 或可信任內網傳送 CLI 登入密碼。
+
+---
+
 ## 🤖 Claude Code Skill 安裝與使用
 
 TDMDO 可作為 **Claude Code 的 Skill** 整合，讓你在對話中直接操作 TDM 新聞與影片。
@@ -385,6 +483,9 @@ from tdm_core import (
 | **基本路徑** | | | |
 | `TDM_DOWNLOAD_DIR` | `<skill>/downloads` | CLI+Web | 影片下載目錄 |
 | `TDM_DB_PATH` | `<skill>/scripts/tdm_news.db` | CLI+Web | SQLite 資料庫路徑 |
+| `TDM_SERVER` | (無) | CLI | 遠端伺服器 URL，設定後 CLI 走 HTTP 遠端模式（見[遠端模式](#-遠端模式多機共用一台-server)） |
+| `TDM_SERVER_PASSWORD` | (無) | CLI | Server 啟用 Web 密碼保護時，CLI 自動登入使用的密碼 |
+| `TDM_REMOTE_POLL_TIMEOUT` | `600` | CLI | 遠端下載進度輪詢總逾時秒數 |
 | **WebDAV 推送** | | | |
 | `WEBDAV_ENABLED` | `false` | CLI+Web | 啟用 WebDAV 自動推送 |
 | `WEBDAV_URL` | (無) | CLI+Web | WebDAV 伺服器 URL（含埠號） |

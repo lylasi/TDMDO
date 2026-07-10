@@ -33,9 +33,12 @@ except ImportError:
 
 # ── 推送模組（可選依賴）──
 try:
-    from push_manager import PushManager, PushResult, push_media, push_text
+    from push_manager import (
+        PUSH_ENABLED, PushManager, PushResult, push_media, push_text,
+    )
     PUSH_MANAGER_AVAILABLE = True
 except ImportError:
+    PUSH_ENABLED = False
     PushManager = None
     PushResult = None
     push_media = None
@@ -130,25 +133,42 @@ def strip_html(raw: str) -> str:
 
 
 def parse_time(t: str) -> float:
-    """解析 HH:MM:SS、MM:SS 或純秒數 → float。"""
-    t = t.strip()
-    if ":" in t:
-        parts = t.split(":")
-        if len(parts) == 3:
-            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-        elif len(parts) == 2:
-            return int(parts[0]) * 60 + float(parts[1])
+    """解析非負的 HH:MM:SS、MM:SS 或純秒數 → float。"""
+    raw = str(t).strip()
     try:
-        return float(t)
-    except ValueError:
-        pass
-    raise ValueError(f"無法解析時間: '{t}' (需要 HH:MM:SS、MM:SS 或純秒數)")
+        if ":" in raw:
+            parts = raw.split(":")
+            if len(parts) == 3:
+                hours, minutes, seconds = int(parts[0]), int(parts[1]), float(parts[2])
+                if hours < 0 or not 0 <= minutes < 60 or not 0 <= seconds < 60:
+                    raise ValueError
+                return hours * 3600 + minutes * 60 + seconds
+            if len(parts) == 2:
+                minutes, seconds = int(parts[0]), float(parts[1])
+                if minutes < 0 or not 0 <= seconds < 60:
+                    raise ValueError
+                return minutes * 60 + seconds
+        value = float(raw)
+        if value < 0:
+            raise ValueError
+        return value
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"無法解析時間: '{raw}' (需要非負的 HH:MM:SS、MM:SS 或純秒數)"
+        ) from None
 
 
 def fmt_time(sec: float) -> str:
     h, m = int(sec // 3600), int((sec % 3600) // 60)
     s = sec % 60
     return f"{h:02d}:{m:02d}:{int(s):02d}" if s == int(s) else f"{h:02d}:{m:02d}:{s:06.3f}"
+
+
+def normalize_m3u8_url(url: str) -> str:
+    """將 TDM 的精確 /play 端點轉成播放清單 URL，不改壞既有 playlist URL。"""
+    if not url:
+        return ""
+    return re.sub(r"/play(?=$|[?#])", "/playelist.m3u8", url, count=1)
 
 
 def fmt_cut_time(sec: float) -> str:
@@ -289,9 +309,7 @@ def get_video_info(news_id: str) -> Optional[dict]:
     if not data or data.get("code") != 0:
         return None
     d = data.get("data", {}).get("detail", {})
-    m3u8 = d.get("video", "")
-    if m3u8 and "/play" in m3u8 and "/playelist" not in m3u8:
-        m3u8 = m3u8.replace("/play", "/playelist.m3u8")
+    m3u8 = normalize_m3u8_url(d.get("video", ""))
     raw = d.get("content", "") or ""
     try:
         content_text = re.sub(r'<[^>]+>', '', _html_lib.unescape(raw)).strip()
@@ -696,9 +714,7 @@ def upsert_news(item: dict):
     # 拿完整 detail（含 m3u8、content）
     detail_data = api_news_detail(nid)
     detail = (detail_data or {}).get("data", {}).get("detail", {})
-    m3u8 = detail.get("video", "") or ""
-    if m3u8 and "/play" in m3u8 and "/playelist" not in m3u8:
-        m3u8 = m3u8.replace("/play", "/playelist.m3u8")
+    m3u8 = normalize_m3u8_url(detail.get("video", "") or "")
     content_html = detail.get("content", "") or ""
     content_text = strip_html(content_html)
     share_url = detail.get("shareUrl", "") or item.get("shareUrl", "") or ""
@@ -943,7 +959,7 @@ def download_video(news_id: str = None, url: str = "",
     # 通用推送（Telegram 等）
     push_results = {}
     tg_ok = False
-    if push_enabled and PUSH_MANAGER_AVAILABLE:
+    if push_enabled and PUSH_MANAGER_AVAILABLE and PUSH_ENABLED:
         if progress_callback:
             progress_callback("📤 推送", 98, "正在推送到 Telegram...")
         push_results = push_to_channels(out, title or Path(out).stem, push_targets)
@@ -1012,7 +1028,8 @@ def trim_video(input_path: str, start: str,
     # ── 裁剪成功：入庫 + 推送 ──
     push_ok = False
 
-    # 入庫
+    # 入庫（全新資料庫首次裁剪時也必須先建立 videos 表）
+    init_db()
     record_video(
         news_id=news_id or "",
         title=Path(out).stem,
@@ -1090,6 +1107,8 @@ def push_to_channels(filepath: str = "", caption: str = "",
     """
     if not PUSH_MANAGER_AVAILABLE:
         return {"_": {"success": False, "error": "push_manager.py 不可用"}}
+    if not PUSH_ENABLED:
+        return {"_": {"success": False, "error": "推送功能未啟用 (PUSH_ENABLED=false)"}}
 
     # 純文字推送（無檔案）
     if not filepath or not Path(filepath).exists():
@@ -1104,7 +1123,7 @@ def push_to_channels(filepath: str = "", caption: str = "",
 
 def is_push_available() -> bool:
     """檢查推送模組是否可用且至少有一個通道已配置。"""
-    if not PUSH_MANAGER_AVAILABLE:
+    if not PUSH_MANAGER_AVAILABLE or not PUSH_ENABLED:
         return False
     try:
         mgr = PushManager()

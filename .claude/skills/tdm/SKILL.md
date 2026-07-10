@@ -8,6 +8,35 @@ argument-hint: "[command] [options]"
 
 以 TDM 官方 API 為核心（不需瀏覽器 JS 渲染），整合新聞查詢、關鍵字搜索、影片下載、裁剪、網頁端。
 
+## 遠端模式（多機共用一台 Server）
+
+設定 `TDM_SERVER` 環境變數後，CLI 所有操作自動走遠端 HTTP 調用，不需本機 SQLite / ffmpeg：
+
+```bash
+# 方式一：環境變數（永久生效）
+set TDM_SERVER=http://192.168.1.100:8080
+
+# 方式二：命令列參數（一次性；--server 可置於子命令前或後）
+python tdm_tool.py --server http://192.168.1.100:8080 news --limit 10
+python tdm_tool.py news --server http://192.168.1.100:8080 --limit 10
+```
+
+| 命令 | 遠端行為 |
+|---|---|
+| `news` | HTTP GET `/api/news` |
+| `search` | HTTP GET `/api/news?search=` |
+| `download` | HTTP POST `/api/download` + 輪詢進度 |
+| `trim` | HTTP POST `/api/trim`（伺服器端檔案） |
+| `push` | HTTP POST `/api/push-text` 或 `/api/push-to-tg` |
+| `db stats` | HTTP GET `/api/db-stats` |
+| `db sync` | HTTP POST `/api/db-sync` |
+| `push-log` | HTTP GET `/api/push-log` |
+
+**客戶端只需要**：`pip install requests`（不需 ffmpeg / SQLite / flask）。
+
+> Server 端需執行 `python app/tdm_web.py --host 0.0.0.0 --port 8080`。
+> 若 Server 設定 `WEB_AUTH_ENABLED=true`，客戶端需設定相同的 `TDM_SERVER_PASSWORD`；建議僅在 HTTPS 或可信任內網使用。
+
 ## 環境檢查
 
 ```bash
@@ -28,6 +57,9 @@ cp .env.example .env
 |---|---|---|
 | `TDM_DOWNLOAD_DIR` | `<skill>/downloads` | 影片下載目錄 |
 | `TDM_DB_PATH` | `<skill>/scripts/tdm_news.db` | SQLite 資料庫路徑 |
+| `TDM_SERVER` | (無) | 遠端伺服器 URL，設定後 CLI 走 HTTP 遠端模式 |
+| `TDM_SERVER_PASSWORD` | (無) | Server 啟用 Web 密碼保護時，CLI 自動登入使用的密碼 |
+| `TDM_REMOTE_POLL_TIMEOUT` | `600` | 遠端下載進度輪詢總逾時秒數 |
 | `WEBDAV_ENABLED` | `false` | 是否啟用 WebDAV 自動推送 |
 | `WEBDAV_URL` | (無) | WebDAV 伺服器 URL |
 | `WEBDAV_USERNAME` | (無) | WebDAV 上傳帳號 |
@@ -44,7 +76,7 @@ cp .env.example .env
 python .claude/skills/tdm/scripts/tdm_tool.py news [OPTIONS]
 
 選項:
-  --category {all,local,world,sport,feature}  分類 (預設: all)
+  --category {all,local,world,sport,feature,27,41,42,143}  分類名稱或 ID (預設: all)
   --limit N                                    篇數 (預設: 10)
   --page N                                     頁碼 (預設: 1)
   --search KEYWORD                             搜尋關鍵字
@@ -59,7 +91,10 @@ python .claude/skills/tdm/scripts/tdm_tool.py news [OPTIONS]
 python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791
 python .claude/skills/tdm/scripts/tdm_tool.py download --url "https://www.tdm.com.mo/zh-hant/news-detail/1217791?isvideo=true"
 python .claude/skills/tdm/scripts/tdm_tool.py download --url "https://www.tdm.com.mo/zh-hant/video/program-detail/850015"
+python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791 --cut 00:00:20,00:00:30
 ```
+
+`--cut` 格式固定為 `START,DURATION`，第二值是持續時間而非結束時間。
 
 **原理**：自動從 URL 提取 6-7 位 ID → 調用 `api/v1.0/news/{id}` 取得 m3u8 → ffmpeg 下載。不需要瀏覽器。
 
