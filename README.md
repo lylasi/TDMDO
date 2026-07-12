@@ -1,518 +1,385 @@
-# TDMDO — 澳廣視（TDM）新聞/影片一站式工具
+# TDMDO — 澳廣視（TDM）新聞／影片工具
 
 [![Python](https://img.shields.io/badge/Python-≥3.9-3776AB)](https://python.org)
 [![Flask](https://img.shields.io/badge/Flask-3.x-000000)](https://flask.palletsprojects.com)
 [![ffmpeg](https://img.shields.io/badge/ffmpeg-required-green)](https://ffmpeg.org)
 
-> **TDMDO** 是以 [澳廣視（TDM）官方 API](https://www.tdm.com.mo) 為核心的新聞查詢與影片下載工具，提供 **網頁端（Web UI）** 與 **指令列（CLI）** 兩種使用方式，並可整合到 **Claude Code 作為 Skill** 使用。不需瀏覽器 JS 渲染，不需登入 Cookie。
+> **使用說明同步：2026-07-12**
+>
+> TDMDO 以澳廣視（TDM）公開內容 API 為核心，提供 Web UI、CLI 與 Claude Code Skill，可查詢新聞、全文搜尋、下載及裁剪新聞影片，並支援 Telegram／WebDAV 推送與遠端模式。
+
+## 實作邊界
+
+- **現行 CLI 的 TDM API 解析只支援新聞**：由 6–7 位新聞 ID，或含該 ID 的 TDM 新聞 URL，查詢 `/api/v1.0/news/{id}`，並只消費 `data.detail.video`。
+- **Web UI 的主要下載流程同樣以新聞 ID／新聞 URL 為準**。Web 後端對其他 URL 沒有專用 TDM API 解析；沒有抽出新聞 ID 時才會交由伺服器上的 `yt-dlp`／`ffmpeg` 嘗試處理。非 TDM URL 若路徑恰含 6–7 位數字段，仍可能被誤判為新聞 ID；因此不代表支援任何 URL，也不保證能下載。
+- TDM 網站已確認節目、新聞音訊與圖片、直播、節目表、微視頻及專題 API，但現行 CLI **沒有**對應的 `program`、`audio`、`images`、`live`、`schedule` 或 `special` 命令。
+- 本文只概述 API。唯一詳細且持續更新的正式文件是 [`docs/TDMDO/reference/TDM_API_Reference.md`](docs/TDMDO/reference/TDM_API_Reference.md)。
 
 ---
 
-## 📦 系統架構
+## 系統架構（主要現行檔案）
 
-```
+下列為目前主線所需檔案的節錄；根目錄另有已廢棄的 `TDM/` 歷史版本及其他報告／協作文件，不作現行實作依據。
+
+```text
 TDMDO/
 ├── app/
-│   └── tdm_web.py              # Web 端（Flask 網頁服務）
+│   └── tdm_web.py                   # 獨立 Flask Web UI／遠端 Server
 ├── .claude/skills/tdm/
-│   ├── SKILL.md                 # Claude Code Skill 定義
-│   ├── .env.example             # 環境變數範例
+│   ├── SKILL.md                     # Claude Code Skill 定義與現行能力
+│   ├── .env.example                 # Skill／Server 環境變數範例
 │   ├── scripts/
-│   │   ├── tdm_core.py          # 核心模組（CLI/Web 共用）
-│   │   ├── tdm_tool.py          # CLI 工具（命令列）
-│   │   ├── push_manager.py      # 通用推送模組（Telegram）
-│   │   ├── tdm_news.db          # SQLite 資料庫（自動建立）
-│   │   └── requirements.txt     # Python 依賴
+│   │   ├── tdm_core.py              # CLI／Web 共用核心
+│   │   ├── tdm_tool.py              # CLI 入口
+│   │   ├── tdm_remote.py            # 遠端 CLI 客戶端
+│   │   ├── push_manager.py          # Telegram 等推送通道
+│   │   └── requirements.txt         # Python 依賴
 │   ├── references/
-│   │   └── tdm-site-reference.md # TDM API 參考文件
+│   │   └── tdm-site-reference.md    # TDM 網站 API 快速導讀
 │   └── examples/
-│       └── example-usage.md     # 使用範例
-├── docs/
-│   └── TDMDO/
-│       ├── reference/
-│       │   └── TDM_API_Reference.md  # TDM API 調研檔案
-│       ├── plan/                    # 計劃文件
-│       ├── meeting/                 # 會議材料
-│       ├── research/                # 調研文件
-│       ├── spec/                    # 需求規格
-│       ├── report/                  # 報告
-│       ├── decision/                # 決策記錄
-│       └── release/                 # 發佈記錄
-├── CLAUDE.md                    # Claude Code 專案指令
-├── .env.example                 # 專案根目錄環境變數範例
-└── README.md                    # 本文件
+│       └── example-usage.md         # 現行可執行範例
+├── docs/TDMDO/reference/
+│   └── TDM_API_Reference.md         # 唯一詳細 TDM API 正式 Reference
+├── CLAUDE.md
+└── README.md
 ```
 
----
-
-## ✨ 功能總覽
-
-### 新聞瀏覽與搜尋
-- 瀏覽 TDM 新聞列表（支援分類篩選：本地、要聞、體育、特稿）
-- 關鍵字全文檢索（支援多關鍵字搜尋）
-- 僅顯示有影片的新聞（自動過濾純文字新聞）
-- 按日期篩選新聞
-- 每則新聞標示 `[影片]` / `[純文字]` 類型
-
-### 影片下載與裁剪
-- 從新聞頁面 URL 或 6-7 位數字 ID 自動提取 m3u8 串流連結
-- 支援 ffmpeg 精確到幀的裁剪（指定開始/結束時間）
-- 支援 yt-dlp 快速下載（無裁剪時自動選用）
-- 支援任何 m3u8 / 公開影片 URL
-- 即時顯示下載進度
-
-### 推送功能
-- **WebDAV 自動推送**：下載/裁剪完成後自動上傳到 Alist / OpenAlist
-- **Telegram 推送**：手動或自動推送影片/圖片/文件/文字到 Telegram
-- **智能發送**：依副檔名自動選擇 `sendVideo` / `sendPhoto` / `sendDocument`
-- **自動降級**：超過限制大小時自動切換發送方式（如 >50MB 影片改用 sendDocument）
-- **可擴展架構**：繼承 `BaseChannel` 即可新增推送通道
-
-### 資料庫管理
-- SQLite 本地資料庫，記錄下載歷史與推送狀態
-- 增量同步最新新聞
-- 按新聞 ID 歸類所有下載版本（原片 + 裁剪版）
-- 標記已刪除檔案（顯示為「遺失」）
+> 專案根目錄目前沒有 `.env.example`；可複製 `.claude/skills/tdm/.env.example` 為 `.claude/skills/tdm/.env`。
 
 ---
 
-## 🚀 Web 端安裝與使用
+## 功能總覽
 
-### 前置需求
+### 已接入
 
-| 依賴 | 版本要求 | 用途 |
-|---|---|---|
-| Python | ≥ 3.9 | 執行程式 |
-| ffmpeg | 任何版本（需在系統 PATH） | 下載與裁剪影片 |
-| yt-dlp | 建議安裝 | 快速下載 m3u8 |
+- 新聞列表：頁碼、筆數、日期、分類及僅影片篩選。
+- 全文搜尋：新聞、微視頻、節目三種 parser choice；目前只查 TDM 搜尋 API 第一頁。
+- 新聞影片：由新聞 ID／新聞 URL 解析 `video` HLS，下載完整影片或直接裁剪。
+- 現有影片裁剪：支援純秒、`MM:SS.sss`、`HH:MM:SS.sss`。
+- Web UI：新聞瀏覽／搜尋、新聞影片查詢與下載、裁剪、下載檔案管理及推送。
+- 推送：WebDAV 自動歸檔，以及 Telegram 文字、影片、圖片、文件推送。
+- 遠端模式：由輕量 CLI 客戶端操作常駐 TDMDO Web Server。
+- SQLite：新聞、下載版本與推送狀態。
 
-### 安裝步驟
+### 網站已確認、尚未接入
+
+以下是網站/API 能力，不是現行 CLI 命令：
+
+- 節目 slug 的 `details`、`feature`、`review`，以及電台節目音訊。
+- 新聞詳情的 `audio`、`images[]`、`iconIndicator` 與 mixed media。
+- `live/categories` 直播、`program-list` 節目表。
+- `short-video` 分類／列表與 `search_pressrelease`。
+- `special` 專題主檔、關聯節目、節目重溫及專題新聞。
+
+完整端點、參數、官網請求、回應結構與限制請查閱[正式 Reference](docs/TDMDO/reference/TDM_API_Reference.md)，不要自行虛構對應命令。
+
+---
+
+## 安裝與環境
+
+### 依賴
+
+| 依賴 | 用途 |
+|---|---|
+| Python ≥ 3.9 | 執行 CLI／Web |
+| `requests>=2.32.0` | TDM API 與遠端客戶端 |
+| `beautifulsoup4>=4.12.0` | 目前保留在 requirements；現行主線程式未直接使用，待依賴整理 |
+| `yt-dlp>=2024.0` | 可選下載器；通用 URL fallback |
+| `flask>=3.0.0` | 獨立 Web Server |
+| ffmpeg（系統工具） | 影片下載 fallback 與裁剪 |
+| `python-telegram-bot` | Telegram 推送，需另外安裝 |
 
 ```bash
-# 1. 確認 ffmpeg 可用
-ffmpeg -version
-
-# 2. 安裝 Python 依賴
+python --version
 pip install -r .claude/skills/tdm/scripts/requirements.txt
+pip install python-telegram-bot
+ffmpeg -version
+```
 
-# 3. （可選）複製環境變數設定檔
+遠端客戶端只需 Python 與 `requests`，不需本機 Flask、SQLite 或 ffmpeg。
+
+### `.env`
+
+```bash
 cp .claude/skills/tdm/.env.example .claude/skills/tdm/.env
 ```
 
-### 啟動 Web 服務
+| 變數 | 預設值 | 適用範圍 | 說明 |
+|---|---|---|---|
+| `TDM_DOWNLOAD_DIR` | `<skill>/downloads` | CLI／Web core | 下載目錄 |
+| `TDM_DB_PATH` | `<skill>/scripts/tdm_news.db` | CLI／Web core | SQLite 路徑 |
+| `TDM_SERVER` | 無 | CLI | 遠端 Server URL |
+| `TDM_SERVER_PASSWORD` | 無 | 遠端 CLI | 必須匹配 Server `WEB_AUTH_PASSWORDS` 其中之一 |
+| `TDM_REMOTE_POLL_TIMEOUT` | `600` | 遠端 CLI | 下載進度輪詢總逾時秒數，必須大於 0 |
+| `WEBDAV_ENABLED` | `false` | CLI／Web core | 啟用 WebDAV 自動推送 |
+| `WEBDAV_URL` | 無 | CLI／Web core | WebDAV Server URL |
+| `WEBDAV_USERNAME` | 無 | CLI／Web core | WebDAV 帳號 |
+| `WEBDAV_PASSWORD` | 無 | CLI／Web core | WebDAV 密碼 |
+| `WEBDAV_PATH` | `/` | CLI／Web core | WebDAV 目標目錄 |
+| `PUSH_ENABLED` | `true` | CLI／Web | 啟用通用推送 |
+| `PUSH_DEFAULT_TARGET` | `tg` | CLI／Web | 預設通道，可用逗號分隔 |
+| `TG_TOKEN` | 無 | CLI／Web | Telegram Bot Token |
+| `TG_CHATID` | 無 | CLI／Web | Telegram Chat ID |
+| `WEB_AUTH_ENABLED` | `false` | Web Server | 啟用 TDMDO 頁面與 API 密碼保護 |
+| `WEB_AUTH_PASSWORDS` | 無 | Web Server | 一個或多個逗號分隔密碼 |
 
-```bash
-# 僅本機訪問（開發用）
-python app/tdm_web.py --host 127.0.0.1 --port 8080
+系統環境變數優先於 `.env`。CLI 與核心模組會可靠載入 `.claude/skills/tdm/.env`。
 
-# 允許內網其他機器訪問
-python app/tdm_web.py --host 0.0.0.0 --port 8080
-```
-
-啟動後終端會顯示：
-
-```
-  TDMDO  http://0.0.0.0:8080
-  下載目錄: D:\CODE\TDMDO\.claude\skills\tdm\downloads
-```
-
-在瀏覽器打開 `http://127.0.0.1:8080` 即可使用。
-
-### Web UI 功能詳解
-
-網頁端分為三個主標籤頁：
-
-#### 📰 新聞標籤
-
-| 功能 | 說明 |
-|---|---|
-| **關鍵字搜尋** | 輸入關鍵字搜尋新聞，支援全文檢索 |
-| **分類篩選** | 切換全部/本地/要聞/體育/特稿分類 |
-| **日期篩選** | 指定日期瀏覽當日新聞 |
-| **僅影片模式** | 勾選後只顯示含影片的新聞 |
-| **搜尋類型** | 可切換搜尋「全部新聞」或「節目」 |
-| **一鍵下載** | 點擊「下載」按鈕直接跳轉到下載頁 |
-
-#### ⬇️ 下載標籤
-
-| 功能 | 說明 |
-|---|---|
-| **輸入 ID/URL** | 貼上 TDM 新聞 URL 或 6-7 位數字 ID |
-| **自動查詢** | 自動取得影片資訊（標題、時長、縮圖、文字內容） |
-| **HLS 預覽** | 使用 hls.js 直接在瀏覽器預覽影片 |
-| **時間裁剪** | 輸入開始/結束時間（HH:MM:SS），從預覽畫面擷取當前時間 |
-| **下載/重新下載** | 下載完整影片或裁剪片段 |
-| **已下載版本列表** | 顯示該新聞所有已下載版本（原片 + 裁剪） |
-| **播放已下載影片** | 點擊 ▶ 按鈕播放已下載的影片 |
-| **推送 WebDAV** | 推送單一檔案到 WebDAV |
-| **推送 Telegram** | 推送單一檔案到 Telegram |
-| **刪除** | 刪除已下載的影片 |
-
-#### 📁 已下載標籤
-
-| 功能 | 說明 |
-|---|---|
-| **群組檢視** | 按新聞 ID 歸類顯示所有已下載影片 |
-| **播放/裁剪/推送** | 每個影片皆可播放、裁剪、推送或刪除 |
-| **狀態標示** | 顯示推送狀態（☁️=已推送、📤=待推送、⚠️=檔案遺失） |
-
-### 密碼保護
-
-Web 端支援簡單的密碼保護層。在 `.env` 中設定：
-
-```env
-WEB_AUTH_ENABLED=true
-WEB_AUTH_PASSWORDS=your_password_here  # 多個密碼用逗號分隔
-```
-
-啟用後訪問頁面需輸入密碼，密碼存儲在瀏覽器 Cookie（30 天有效）。
-
-### 檔案服務
-
-所有已下載的影片可透過 `http://127.0.0.1:8080/api/download-file/<檔名>` 直接訪問或下載，方便分享給內網其他用戶。
+`app/tdm_web.py` 也會讀取**啟動時工作目錄**的 `.env`（不一定是專案根目錄），但它目前是**先 import `tdm_core`，再讀該 `.env`**；因此其中的 `TDM_DOWNLOAD_DIR`、`TDM_DB_PATH`、WebDAV 及通用推送配置在該次程序中不會改變已初始化的 core／push-manager 常數。請將這些配置放在 `.claude/skills/tdm/.env`。工作目錄 `.env` 只適合之後才讀取的 Web 認證等配置。
 
 ---
 
-## 🛠️ CLI 工具安裝與使用
+## Web UI
 
-### 安裝
+### 啟動
 
-同 Web 端前置需求，安裝 Python 依賴即可。
+```bash
+# 僅本機
+python app/tdm_web.py --host 127.0.0.1 --port 8080
 
-### 命令參考
+# 允許內網訪問
+python app/tdm_web.py --host 0.0.0.0 --port 8080
+```
+
+瀏覽器開啟 `http://127.0.0.1:8080`。使用 `0.0.0.0` 時，請處理防火牆並啟用認證或只在可信任內網使用。
+
+### 實際 UI 行為
+
+Web UI 有「新聞」、「下載」、「已下載」三個標籤：
+
+- **新聞列表**：可選分類、日期及僅影片，呼叫 `GET /api/news` 的新聞列表流程。
+- **關鍵字搜尋**：有關鍵字時，`GET /api/news?search=...&stype=...` 會改走 `query_search`，不是對目前列表做本地過濾。搜尋類型 UI 提供 `search_news`、`search_program`；搜尋底層只取 TDM 全文搜尋第一頁。頁碼 UI 不代表會取得 TDM 搜尋後續頁。
+- **節目搜尋限制**：`search_program` 結果結構、網址顯示與下載銜接仍以新聞模型呈現，尚非完整節目支援。
+- **下載查詢**：輸入 6–7 位新聞 ID 或含該 ID 的 TDM 新聞 URL，查詢新聞詳情的 `video`。
+- **其他 URL**：UI 查詢階段通常無法建立新聞資訊。直接呼叫 Web 下載 API 時，沒有可解析新聞 ID 的 URL 才會交由 Server 的 `yt-dlp`／ffmpeg fallback 嘗試；若非 TDM URL 路徑恰含 6–7 位數字段，現行 `extract_id()` 仍可能先把它誤判為新聞 ID，因此其他 URL 不屬於保證支援範圍。
+- **時間格式**：開始、結束或 duration 後端均接受純秒、`MM:SS.sss`、`HH:MM:SS.sss`，包括小數秒。播放器「擷取時間」按鈕目前填入整秒，但可手動輸入毫秒。
+- **檔案管理**：可播放、下載、裁剪、刪除、推送 WebDAV／Telegram，並按新聞 ID 顯示原片與裁剪版本。
+
+### Web 密碼保護
+
+```env
+WEB_AUTH_ENABLED=true
+WEB_AUTH_PASSWORDS=password_one,password_two
+```
+
+啟用後，頁面與業務 API 由 Flask 後端驗證 Cookie。Cookie 最長 30 天。這是 **TDMDO Web/API 認證層**，與 TDM 公開內容 API 是否登入無關。
+
+### 檔案服務
+
+```text
+http://127.0.0.1:8080/api/download-file/<檔名>
+http://127.0.0.1:8080/api/download-file/<檔名>?dl=1
+```
+
+---
+
+## CLI
 
 ```bash
 python .claude/skills/tdm/scripts/tdm_tool.py <命令> [參數]
 ```
 
-#### `news` — 查詢新聞列表
+### `news` — 新聞列表
 
 ```bash
-# 顯示 10 篇最新新聞
 python .claude/skills/tdm/scripts/tdm_tool.py news --limit 10
+python .claude/skills/tdm/scripts/tdm_tool.py news --page 2 --limit 20
+python .claude/skills/tdm/scripts/tdm_tool.py news --video-only --limit 10
+python .claude/skills/tdm/scripts/tdm_tool.py news --date 2026-07-12 --limit 20
 
-# 僅顯示有影片的新聞
-python .claude/skills/tdm/scripts/tdm_tool.py news --video-only --limit 5
-
-# 按分類查詢（27=本地、41=要聞、42=體育、143=特稿）
-python .claude/skills/tdm/scripts/tdm_tool.py news --category 27 --limit 10
-
-# 指定日期
-python .claude/skills/tdm/scripts/tdm_tool.py news --date 2026-07-09 --limit 20
-
-# 過濾關鍵字
-python .claude/skills/tdm/scripts/tdm_tool.py news --search "颱風" --limit 5
+# 分類可用別名或數字
+python .claude/skills/tdm/scripts/tdm_tool.py news --category local --limit 10
+python .claude/skills/tdm/scripts/tdm_tool.py news --category 42 --limit 10
 ```
 
-#### `search` — 關鍵字全文搜索
+| CLI 別名 | API `Category` | 類別 |
+|---|---:|---|
+| `all` | 空值 | 全部 |
+| `local` | `27` | 本地 |
+| `world` | `41` | 要聞 |
+| `sport` | `42` | 體育 |
+| `feature` | `143` | 特稿 |
+
+API 原生分類是數字；別名由 CLI 轉換。
 
 ```bash
-# 基本搜尋
-python .claude/skills/tdm/scripts/tdm_tool.py search "澳門 政府"
-
-# 僅搜尋影片新聞
-python .claude/skills/tdm/scripts/tdm_tool.py search "世界盃" --video-only
-
-# 搜尋節目
-python .claude/skills/tdm/scripts/tdm_tool.py search "澳視新聞" --type search_program
-
-# 指定顯示數量
-python .claude/skills/tdm/scripts/tdm_tool.py search "暴雨" --limit 30
+python .claude/skills/tdm/scripts/tdm_tool.py news --search "暴雨" --limit 20
 ```
 
-搜尋類型 (`--type`)：
-| 值 | 說明 |
-|---|---|
-| `search_news`（預設） | 全部新聞 |
-| `search_program` | 節目 |
-| `search_short_video` | 微視頻 |
+- **本地模式**：先取得指定 `/news` 列表頁，再在當頁結果過濾關鍵字，不是全站搜尋。
+- **遠端模式**：Server 的 `/api/news?search=` 會改走 `query_search` 全文搜尋，而且只查第一頁。
+- 需要明確全文搜尋時，使用 `search`。
 
-#### `download` — 下載影片
+### `search` — 全文搜尋
 
 ```bash
-# 從新聞 ID 下載
+python .claude/skills/tdm/scripts/tdm_tool.py search 澳門 政府 --limit 15
+python .claude/skills/tdm/scripts/tdm_tool.py search 暴雨 警告 --type search_news --video-only --limit 10
+python .claude/skills/tdm/scripts/tdm_tool.py search 澳門 --type search_short_video --limit 10
+python .claude/skills/tdm/scripts/tdm_tool.py search 澳門 --type search_program --limit 10
+```
+
+現行 parser 只有：
+
+- `search_news`（預設）
+- `search_short_video`
+- `search_program`
+
+`query_search` 固定請求 TDM 搜尋 API 的 `Page=1`，不會自動跨頁。CLI 沒有 `search_pressrelease` choice。`search_program` 與 `search_short_video` 的 item 契約不同於新聞；現行輸出仍會以新聞 URL 模式顯示，後續下載解析不完整，不要假定能直接交給 `download`。
+
+### `download` — 下載新聞影片
+
+只接受 6–7 位新聞 ID，或現行 `extract_id()` 可辨識、以路徑形式包含該 ID 的標準 TDM 新聞 URL。不要假定 query 參數中的任意數字都能解析：
+
+```bash
 python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791
+python .claude/skills/tdm/scripts/tdm_tool.py download --url "https://www.tdm.com.mo/zh-hant/news-detail/1217791?isvideo=true"
 
-# 從 URL 下載（自動提取 ID）
-python .claude/skills/tdm/scripts/tdm_tool.py download --url "https://www.tdm.com.mo/zh-hant/news-detail/1217791"
-
-# 下載節目影片
-python .claude/skills/tdm/scripts/tdm_tool.py download --url "https://www.tdm.com.mo/zh-hant/video/program-detail/850015"
-
-# 下載後自動推送到 Telegram
-python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791 --push
-
-# 下載時裁剪（參數：開始時間,持續時間）
-python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791 --cut "00:00:20,00:00:30"
-
-# 強制覆蓋已存在的檔案
-python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791 --overwrite
-
-# 指定輸出路徑
-python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791 --output D:/Videos/news.mp4
+# 輸出、覆蓋、下載後推送
+python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791 --output "downloads/news.mp4"
+python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791 --output "downloads/news.mp4" --overwrite
+python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791 --push --push-target tg
 ```
 
-#### `trim` — 裁剪已下載的影片
+現行流程：提取新聞 ID → `GET /api/v1.0/news/{id}` → 讀取 `data.detail.video` → 以 yt-dlp 或 ffmpeg 下載。不要使用節目 slug、節目主檔 ID、集數 ID 或片段 ID 代替新聞 ID。
+
+`--cut` 固定是 `START,DURATION`，第二值是**持續時間**，不是結束時間：
 
 ```bash
-# 裁剪指定時間範圍
-python .claude/skills/tdm/scripts/tdm_tool.py trim --input video.mp4 --start 00:00:20 --end 00:00:50
+# 從 20 秒開始，持續 30 秒
+python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791 --cut 00:00:20,00:00:30
 
-# 指定持續時間
-python .claude/skills/tdm/scripts/tdm_tool.py trim --input video.mp4 --start 00:05:30 --duration 00:01:00
-
-# 指定輸出路徑
-python .claude/skills/tdm/scripts/tdm_tool.py trim --input video.mp4 --start 00:00:10 --end 00:00:20 --output clip.mp4
+# 從 10.500 秒開始，持續 2.250 秒
+python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791 --cut 10.500,2.250
+python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791 --cut 00:10.500,00:02.250 --output "downloads/clip.mp4"
 ```
 
-#### `push` — 獨立推送命令
+### `trim` — 裁剪現有影片
+
+`--start` 必填；`--end` 與 `--duration` 必須二選一。
+
+| 格式 | 範例 |
+|---|---|
+| 純秒 | `10.500` |
+| `MM:SS.sss` | `00:10.500` |
+| `HH:MM:SS.sss` | `00:00:10.500` |
 
 ```bash
-# 推送文字
-python .claude/skills/tdm/scripts/tdm_tool.py push --text "下載完成：世界盃16強"
+# 10.500 至 13.125 秒，長度 2.625 秒
+python .claude/skills/tdm/scripts/tdm_tool.py trim \
+  --input "downloads/news.mp4" --start 10.500 --end 13.125 \
+  --output "downloads/clip_ms.mp4"
 
-# 推送影片（自動判斷類型）
-python .claude/skills/tdm/scripts/tdm_tool.py push --video video.mp4 --caption "新聞影片"
-
-# 推送圖片
-python .claude/skills/tdm/scripts/tdm_tool.py push --image photo.jpg --caption "截圖"
-
-# 推送文件
-python .claude/skills/tdm/scripts/tdm_tool.py push --file report.pdf --caption "今日報表"
+# 同一範圍，以 duration 表示
+python .claude/skills/tdm/scripts/tdm_tool.py trim \
+  --input "downloads/news.mp4" --start 00:00:10.500 --duration 00:00:02.625 \
+  --output "downloads/clip_ms.mp4"
 ```
 
-#### `db` — 資料庫管理
+小數秒會轉成浮點秒數交給 ffmpeg。實際精度受來源時間戳、影格率、關鍵幀、音訊取樣及 ffmpeg 對輸入編碼的處理影響，不保證逐幀或逐毫秒完全一致。
+
+### `push` — Telegram／通用通道推送
+
+Telegram 需要 `python-telegram-bot`、`TG_TOKEN` 與 `TG_CHATID`。四類內容互斥，必須擇一；`--target` 指定目標通道。
 
 ```bash
-# 初始化資料庫
+python .claude/skills/tdm/scripts/tdm_tool.py push --text "新聞更新了" --target tg
+python .claude/skills/tdm/scripts/tdm_tool.py push --video "downloads/news.mp4" --caption "新聞影片" --target tg
+python .claude/skills/tdm/scripts/tdm_tool.py push --image "downloads/photo.jpg" --caption "新聞截圖" --target tg
+python .claude/skills/tdm/scripts/tdm_tool.py push --file "downloads/report.pdf" --caption "新聞資料" --target tg
+```
+
+支援文字、影片、圖片、文件。圖片推送是發送既有本機圖片，不代表 CLI 能下載新聞 `images[]`。Telegram 通道會依檔案類型使用 `sendVideo`、`sendPhoto` 或 `sendDocument`，並受 Bot API 與實作中的大小限制約束。
+
+### `db` 與 `push-log`
+
+```bash
 python .claude/skills/tdm/scripts/tdm_tool.py db init
-
-# 查看資料庫統計
 python .claude/skills/tdm/scripts/tdm_tool.py db stats
-
-# 增量同步最新新聞到本地資料庫
-python .claude/skills/tdm/scripts/tdm_tool.py db sync
-
-# 強制同步（更新已有新聞）
-python .claude/skills/tdm/scripts/tdm_tool.py db sync --force
-
-# 不限 7 天，同步更早的新聞
-python .claude/skills/tdm/scripts/tdm_tool.py db sync --all-days --pages 5
-```
-
-#### `push-log` — 查看推送記錄
-
-```bash
+python .claude/skills/tdm/scripts/tdm_tool.py db sync --pages 3
+python .claude/skills/tdm/scripts/tdm_tool.py db sync --pages 3 --force
 python .claude/skills/tdm/scripts/tdm_tool.py push-log --limit 20
 ```
 
+parser 雖然存在 `db sync --all-days`，但它對應的上游 `IsShowSevenDay` 語義不可靠：`false` 或省略在抽樣中可能反而取得更少資料，且不代表全歷史。因此本文不推薦以 `--all-days` 作「全歷史同步」範例。
+
+`push-log` 的真實資料來源是 SQLite `news` 表的 `push_url`、`push_time`；查詢中的 `downloaded` 只是 `push_time` 的欄位別名，不是下載時間。現行資料不來自 `webdav_push_log` 表；初始化會清理舊版遺留的同名表。
+
 ---
 
-## 🌐 遠端模式（多機共用一台 Server）
+## 遠端模式
 
-設定 `TDM_SERVER` 後，CLI 所有操作自動走 HTTP 調用遠端 Flask 伺服器。客戶端**只需 `pip install requests`**，不需要 SQLite / ffmpeg / flask。
+遠端 CLI 將命令轉成 TDMDO Web Server HTTP 請求。Server 執行 API、SQLite、下載、裁剪與推送；客戶端只需 `requests`。
 
-### 架構
-
-```
-┌─────────────────────┐
-│ Server 機（常駐）     │
-│ flask + ffmpeg       │
-│ + SQLite + 影片儲存   │  ← 所有重裝備都在這裡
-└────────┬────────────┘
-         │ HTTP API (:8080)
-    ┌────┴────┬────────┐
-    │         │        │
-┌───┴──┐ ┌───┴──┐ ┌───┴──┐
-│ A 機  │ │ B 機  │ │ C 機  │  ← 只有 requests
-└──────┘ └──────┘ └──────┘
-```
-
-### 使用方法
-
-**步驟 1** — Server 機啟動 Web 服務：
+### 啟動與連線
 
 ```bash
+# Server
 python app/tdm_web.py --host 0.0.0.0 --port 8080
-```
 
-**步驟 2** — 客戶端設定遠端伺服器（二選一）：
-
-```bash
-# 方式一：環境變數（永久生效，寫在 .env）
-TDM_SERVER=http://192.168.1.100:8080
-
-# 方式二：命令列參數（一次性）
+# Client：--server 可放在子命令前或後
 python .claude/skills/tdm/scripts/tdm_tool.py --server http://192.168.1.100:8080 news --limit 10
+python .claude/skills/tdm/scripts/tdm_tool.py news --server http://192.168.1.100:8080 --limit 10
 ```
 
-**步驟 3** — 照常使用所有 CLI 命令：
-
-```bash
-# 查詢新聞（走遠端）
-python .claude/skills/tdm/scripts/tdm_tool.py news --video-only --limit 10
-
-# 搜尋新聞
-python .claude/skills/tdm/scripts/tdm_tool.py search "颱風" --video-only
-
-# 下載影片（由 Server 機執行 ffmpeg，完成後提供下載連結）
-python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791
-
-# 裁剪影片（Server 機上已有檔案）
-python .claude/skills/tdm/scripts/tdm_tool.py trim --input 1217791_新聞.mp4 --start 00:00:20 --end 00:00:50
-
-# 查看遠端資料庫統計
-python .claude/skills/tdm/scripts/tdm_tool.py db stats
-
-# 觸發遠端同步
-python .claude/skills/tdm/scripts/tdm_tool.py db sync --all-days --pages 5
-
-# 推送文字到 Telegram（透過 Server 機）
-python .claude/skills/tdm/scripts/tdm_tool.py push --text "下載完成"
-```
-
-### 遠端模式支援的命令
-
-| 命令 | 遠端行為 | 備註 |
-|---|---|---|
-| `news` | HTTP GET `/api/news` | 完整支援參數 |
-| `search` | HTTP GET `/api/news?search=` | 完整支援參數 |
-| `download` | HTTP POST `/api/download` + 輪詢進度 | 影片儲存在 Server 機 |
-| `trim` | HTTP POST `/api/trim` | 針對 Server 機既有檔案 |
-| `push` | HTTP POST `/api/push-text` 或 `/api/push-to-tg` | 透過 Server 機推送 |
-| `db stats` | HTTP GET `/api/db-stats` | |
-| `db sync` | HTTP POST `/api/db-sync` | 觸發 Server 機同步 |
-| `push-log` | HTTP GET `/api/push-log` | |
-| `db init` | ⚠️ 不支援（由 Server 端管理） | 顯示提示訊息 |
-
-> **注意**：遠端模式下 `download` / `trim` 的影片儲存在 Server 機的 `TDM_DOWNLOAD_DIR`，完成後終端會顯示下載連結。
-
-### 遠端模式的 .env 配置
-
-在客戶端的 `.env` 中只需設定：
+也可配置：
 
 ```env
-# 遠端伺服器 URL
 TDM_SERVER=http://192.168.1.100:8080
-
-# Server 啟用 WEB_AUTH_ENABLED 時，CLI 自動登入使用
-TDM_SERVER_PASSWORD=your_server_password
-
-# 遠端下載進度輪詢總逾時秒數
+TDM_SERVER_PASSWORD=your_client_password
 TDM_REMOTE_POLL_TIMEOUT=600
 ```
 
-Server 機的 `.env` 保持原有完整配置即可（Telegram / WebDAV / Web 密碼保護等）。若啟用密碼保護，建議只在 HTTPS 或可信任內網傳送 CLI 登入密碼。
+### 真實路由
 
----
-
-## 🤖 Claude Code Skill 安裝與使用
-
-TDMDO 可作為 **Claude Code 的 Skill** 整合，讓你在對話中直接操作 TDM 新聞與影片。
-
-### 安裝方式
-
-Skill 已預置於專案中，路徑為 `.claude/skills/tdm/`。當你在 TDMDO 專案目錄中使用 Claude Code 時，Skill 已自動可用。
-
-若要在其他專案中使用，請將 `.claude/skills/tdm/` 目錄複製到該專案的 `.claude/skills/` 下。
-
-### 觸發關鍵字
-
-在對話中提及以下關鍵字時，Skill 會自動觸發：
-
-| 關鍵字 | 觸發功能 |
+| CLI | 遠端路由 |
 |---|---|
-| TDM、澳廣視、澳門新聞、tdm.com.mo | 載入 TDMDO Skill |
-| 新聞查詢、關鍵字搜索、新聞搜索 | 啟動新聞查詢流程 |
-| 影片下載、下載影片、m3u8 | 啟動影片下載流程 |
-| 裁剪影片、剪片、trim | 啟動裁剪流程 |
+| `news` | `GET /api/news` |
+| `search` | `GET /api/news?search=...&stype=...` |
+| `download` | `POST /api/download`，輪詢 `GET /api/progress/{id}` |
+| `trim` | `POST /api/trim` |
+| `push --text` | `POST /api/push-text` |
+| `push` 媒體 | `POST /api/push-to-tg` |
+| `db stats` | `GET /api/db-stats` |
+| `db sync` | `POST /api/db-sync` |
+| `push-log` | `GET /api/push-log` |
 
-### 可用對話範例
+沒有 `/api/search` 路由；遠端 `search` 仍走 `/api/news?search=`，Server 再呼叫 `query_search`，同樣只查 TDM 搜尋第一頁。遠端 `db init` 由 Server 管理，客戶端只顯示提示。
 
-```
-使用者: 查詢最新的 TDM 新聞
-→ Claude 自動執行 tdm_tool.py news 顯示最新新聞
+### 認證
 
-使用者: 搜索關於「颱風」的新聞
-→ Claude 自動執行 tdm_tool.py search 颱風
+Server 設定：
 
-使用者: 下載這個影片 https://www.tdm.com.mo/zh-hant/news-detail/1217791
-→ Claude 自動提取 ID，執行 download 命令
-
-使用者: 裁剪 video.mp4 從 00:00:20 到 00:00:50
-→ Claude 自動執行 trim_video 函數
-```
-
-### 推送管理器獨立使用
-
-`push_manager.py` 可獨立匯入使用，不依賴 TDM 模組：
-
-```python
-from push_manager import push_text, push_video, push_image, push_media
-
-# 一行推送
-push_text("Hello Telegram!")
-push_video("video.mp4", "新聞影片")
-push_image("photo.jpg", "截圖")
-push_media("report.pdf", "文件")  # 自動判斷類型
+```env
+WEB_AUTH_ENABLED=true
+WEB_AUTH_PASSWORDS=password_one,password_two
 ```
 
-### 核心模組獨立使用
+Client 的 `TDM_SERVER_PASSWORD` 必須匹配 `WEB_AUTH_PASSWORDS` 其中之一。客戶端收到 401 後會呼叫 `POST /auth` 取得 Cookie，再重試請求。建議僅透過 HTTPS 或可信任內網傳送密碼。
 
-```python
-from tdm_core import (
-    query_news_list,    # 查詢新聞列表
-    query_search,       # 關鍵字搜尋
-    get_video_info,     # 取得影片資訊
-    download_video,     # 下載影片
-    trim_video,         # 裁剪影片
-    push_to_webdav,     # WebDAV 推送
-    init_db,            # 初始化資料庫
-    get_grouped_videos, # 取得已下載影片（歸類）
-)
+TDM 公開內容 API 與 TDMDO Server 是不同認證層：前者一般免登入；`member/*` 等會員 API 是例外；後者可由上述配置保護。
+
+### 遠端檔案限制
+
+- `download` 的輸出位於 Server；自訂 `output` 只允許 `TDM_DOWNLOAD_DIR` 的直屬檔名，不能寫入子目錄或目錄外路徑。
+- `trim --input` 是 Server `TDM_DOWNLOAD_DIR` 中的檔名；不會上傳 Client 檔案。`trim --output` 同樣只能是該目錄的直屬檔名。
+- `push --video/--image/--file` 只取 Client 參數的 basename，並在 Server `TDM_DOWNLOAD_DIR` 找同名檔；不會上傳 Client 檔案。
+- 下載每 2 秒輪詢一次，預設總逾時 600 秒。逾時或 Client 中止只停止輪詢，**不會取消 Server 任務**。
+
+```bash
+# Server 的下載目錄須已存在 1217791_news.mp4
+python .claude/skills/tdm/scripts/tdm_tool.py --server http://192.168.1.100:8080 \
+  trim --input "1217791_news.mp4" --start 10.500 --duration 2.625 --output "clip.mp4"
+
+python .claude/skills/tdm/scripts/tdm_tool.py --server http://192.168.1.100:8080 \
+  push --video "1217791_news.mp4" --caption "新聞影片" --target tg
 ```
 
 ---
 
-## ⚙️ 環境變數配置
+## WebDAV 自動推送
 
-### 完整變數表
-
-| 變數 | 預設值 | 適用範圍 | 說明 |
-|---|---|---|---|
-| **基本路徑** | | | |
-| `TDM_DOWNLOAD_DIR` | `<skill>/downloads` | CLI+Web | 影片下載目錄 |
-| `TDM_DB_PATH` | `<skill>/scripts/tdm_news.db` | CLI+Web | SQLite 資料庫路徑 |
-| `TDM_SERVER` | (無) | CLI | 遠端伺服器 URL，設定後 CLI 走 HTTP 遠端模式（見[遠端模式](#-遠端模式多機共用一台-server)） |
-| `TDM_SERVER_PASSWORD` | (無) | CLI | Server 啟用 Web 密碼保護時，CLI 自動登入使用的密碼 |
-| `TDM_REMOTE_POLL_TIMEOUT` | `600` | CLI | 遠端下載進度輪詢總逾時秒數 |
-| **WebDAV 推送** | | | |
-| `WEBDAV_ENABLED` | `false` | CLI+Web | 啟用 WebDAV 自動推送 |
-| `WEBDAV_URL` | (無) | CLI+Web | WebDAV 伺服器 URL（含埠號） |
-| `WEBDAV_USERNAME` | (無) | CLI+Web | WebDAV 上傳帳號 |
-| `WEBDAV_PASSWORD` | (無) | CLI+Web | WebDAV 上傳密碼 |
-| `WEBDAV_PATH` | `/` | CLI+Web | WebDAV 上傳目標目錄 |
-| **Telegram 推送** | | | |
-| `PUSH_ENABLED` | `true` | CLI+Web | 啟用推送功能 |
-| `PUSH_DEFAULT_TARGET` | `tg` | CLI+Web | 預設推送通道 |
-| `TG_TOKEN` | (無) | CLI+Web | Telegram Bot Token（@BotFather 取得） |
-| `TG_CHATID` | (無) | CLI+Web | Telegram Chat ID（個人/群組/頻道） |
-| **Web 密碼保護** | | | |
-| `WEB_AUTH_ENABLED` | `false` | Web 端 | 啟用頁面密碼保護 |
-| `WEB_AUTH_PASSWORDS` | (無) | Web 端 | 允許的密碼（多個用逗號分隔） |
-
-### 配置載入順序
-
-1. 系統環境變數（最高優先級）
-2. `.env` 檔案（`<skill>/.env` 或專案根目錄 `.env`）
-3. 程式內建預設值（最低優先級）
-
-### 設定檔位置
-
-- **Skill 層級**：`.claude/skills/tdm/.env`（CLI 工具啟動時自動載入）
-- **專案根目錄**：`.env`（Web 端啟動時自動載入）
-
-### WebDAV 配置範例
+在 `.claude/skills/tdm/.env` 設定：
 
 ```env
 WEBDAV_ENABLED=true
@@ -522,182 +389,160 @@ WEBDAV_PASSWORD=your_password_here
 WEBDAV_PATH=/TDM新聞/
 ```
 
-> Alist 後台 → 用戶 → 新增或編輯專用帳號，勾選「WebDAV 讀寫」權限。
-
-### Telegram 配置範例
-
-```env
-PUSH_ENABLED=true
-PUSH_DEFAULT_TARGET=tg
-TG_TOKEN=1234567890:ABCdefGHIJklmNOPqrStuVWXyz
-TG_CHATID=-1001234567890
-```
-
-取得方式：
-- **TG_TOKEN**：在 Telegram 中搜尋 [@BotFather](https://t.me/BotFather)，建立 Bot 後取得 Token
-- **TG_CHATID**：將 Bot 加入頻道/群組，發送一條訊息後訪問 `https://api.telegram.org/bot<TG_TOKEN>/getUpdates` 取得 Chat ID
+Alist／OpenAlist 帳號需有 WebDAV 讀寫權限，目標目錄亦須存在。成功下載會嘗試自動上傳；推送失敗不會把已完成下載改判為失敗。
 
 ---
 
-## 🔄 典型工作流
+## Claude Code Skill
 
-### 1. 查詢今日有影片的新聞並下載
+Skill 位於 `.claude/skills/tdm/`。在對話中提及 TDM、澳廣視、澳門新聞、新聞搜尋、新聞影片下載、裁剪或遠端模式，可觸發現行流程。
 
-```bash
-# 找出有影片的新聞
-python .claude/skills/tdm/scripts/tdm_tool.py news --video-only --limit 10
+```text
+使用者：查詢最新的 TDM 影片新聞
+→ 執行 tdm_tool.py news --video-only
 
-# 下載指定 ID
-python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791
+使用者：搜尋關於「颱風」的新聞
+→ 執行 tdm_tool.py search 颱風
+
+使用者：下載 https://www.tdm.com.mo/zh-hant/news-detail/1217791
+→ 提取新聞 ID，執行 download 命令
+
+使用者：把 video.mp4 從 10.500 秒裁到 13.125 秒
+→ 執行 tdm_tool.py trim --input video.mp4 --start 10.500 --end 13.125
 ```
 
-### 2. 從新聞連結一鍵下載並剪輯精華
+對話式裁剪應執行現行 `trim` CLI 命令，不應描述成直接呼叫某個未展示的「函數」。
+
+---
+
+## TDM API 簡表
+
+基礎 URL：`https://www.tdm.com.mo/api/v1.0`
+
+| API | 正確端點／範例 | 現行消費範圍 |
+|---|---|---|
+| 新聞列表 | `/news?Page=1&PageSize=40&Lang=zh` | `news` 使用；分類、日期、影片篩選 |
+| 新聞詳情 | `/news/{id}` | 回應可含 `video`、`audio`、`images[]`、`iconIndicator`；Skill 只消費 `video` |
+| 全文搜尋 | `/search/?Keywords=澳門&SelectType=search_news&Page=1&PageSize=15&FullSearch=true&DateSort=true` | `search` 使用，但只查第一頁 |
+| 搜尋建議 | `/searchbar?query=澳門&Lang=zh` | 目前 404，網站搜尋欄也不再使用，不可依賴 |
+
+TDM 新聞、節目、直播、搜尋、專題與微視頻等公開內容一般免登入、Cookie 與瀏覽器 JS；`member/*` 等會員功能例外。TDMDO Web 認證是獨立層，不可混為一談。
+
+### 分類
+
+| 類別 | API 數字 | CLI 別名 |
+|---|---:|---|
+| 本地 | `27` | `local` |
+| 要聞 | `41` | `world` |
+| 體育 | `42` | `sport` |
+| 特稿 | `143` | `feature` |
+
+---
+
+## 典型工作流
+
+### 查詢、下載並以毫秒裁剪
 
 ```bash
-# 下載並裁剪（下載時只下載需要的片段）
+python .claude/skills/tdm/scripts/tdm_tool.py news --category local --video-only --page 1 --limit 10
+python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791 --output "downloads/news.mp4"
+python .claude/skills/tdm/scripts/tdm_tool.py trim \
+  --input "downloads/news.mp4" --start 10.500 --end 13.125 \
+  --output "downloads/news_highlight.mp4"
+```
+
+### 下載時直接裁剪並推送
+
+```bash
 python .claude/skills/tdm/scripts/tdm_tool.py download \
   --url "https://www.tdm.com.mo/zh-hant/news-detail/1217791" \
-  --cut "00:00:20,00:00:30"
-
-# 或先下載完整影片，再裁剪
-python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791
-python .claude/skills/tdm/scripts/tdm_tool.py trim \
-  --input "1217791_世界盃16強.mp4" \
-  --start 00:00:20 --end 00:00:50
+  --cut 00:10.500,00:02.250 \
+  --output "downloads/highlight.mp4" \
+  --push --push-target tg
 ```
 
-### 3. Web 端圖形化操作
+### 搜尋後下載
 
 ```bash
-# 啟動 Web 服務
+python .claude/skills/tdm/scripts/tdm_tool.py search 澳門 交通 --type search_news --video-only --limit 10
+python .claude/skills/tdm/scripts/tdm_tool.py download --id 1217791
+```
+
+### 啟動 Web Server
+
+```bash
 python app/tdm_web.py --host 0.0.0.0 --port 8080
 ```
 
-1. 在瀏覽器打開 `http://<你的IP>:8080`
-2. 切換到 **📰 新聞** 標籤瀏覽新聞
-3. 找到有影片的新聞，點擊「下載」自動跳轉
-4. 在 **⬇️ 下載** 標籤確認資訊後點「下載/裁剪」
-5. 下載完成後切換到 **📁 已下載** 查看所有影片
+---
 
-### 4. 搜尋特定主題並推送到 Telegram
+## 已知限制
 
-```bash
-# 搜尋新聞
-python .claude/skills/tdm/scripts/tdm_tool.py search "澳門 交通" --video-only
-
-# 下載影片並推送
-python .claude/skills/tdm/scripts/tdm_tool.py download --id 1218239 --push
-
-# 或推送已下載的檔案
-python .claude/skills/tdm/scripts/tdm_tool.py push \
-  --video "1218239_南灣地段.mp4" \
-  --caption "澳門南灣地段新聞"
-```
-
-### 5. 全自動 WebDAV 歸檔
-
-配置 `.env` 後，每次執行 `download` 或 `trim` 都會自動將檔案上傳到 WebDAV 伺服器（如 Alist），不再需要手動搬運檔案。
+1. CLI 的 TDM API 下載解析只接受新聞 ID／新聞 URL，並只消費新聞詳情 `video`。
+2. 搜尋固定只查第一頁；`search_program`、`search_short_video` 的顯示、URL 與下載解析不完整。
+3. 本地與遠端 `news --search` 語義不同：本地過濾當頁列表，遠端改走全文搜尋。
+4. 節目 slug、新聞音訊／圖片、直播、節目表與專題已在網站 API 確認，但沒有對應 CLI 流程。
+5. `/api/v1.0/searchbar` 目前 404；不可作搜尋建議依據。
+6. `IsShowSevenDay=true` 不是完整歷史開關；`false` 或省略可能取得更少資料。
+7. `/short-video/{id}` 獨立詳情契約尚未確認；抽樣回 404。
+8. 字幕欄位與 HLS 字幕軌尚未確認，不能宣稱已支援或全站不存在。
+9. 遠端媒體推送與裁剪不會上傳 Client 本機檔案。
+10. Web UI／後端對非新聞 URL 只依賴 yt-dlp／ffmpeg fallback，成功與否取決於來源及工具能力。
+11. 遠端輪詢逾時不取消 Server 下載任務。
+12. 裁剪精度受來源時間戳、影格率、關鍵幀、音訊取樣及 ffmpeg 行為影響。
 
 ---
 
-## 📚 新聞分類對照
-
-| 前端顯示 | API Category 參數 | 分類 ID |
-|---|---|---|
-| 全部 | (不指定) | — |
-| 本地 | `local` | 27 |
-| 要聞 | `world` | 41 |
-| 體育 | `sport` | 42 |
-| 特稿 | `feature` | 143 |
-
-## 🌐 TDM API 架構（簡要）
-
-所有 API 為公開 RESTful，**無需認證**。
-
-| API | URL | 說明 |
-|---|---|---|
-| 新聞列表 | `api/v1.0/news?Page=1&PageSize=40&Lang=zh` | 分頁新聞 |
-| 新聞詳情+影片 | `api/v1.0/news/{id}` | `data.detail.video` = m3u8 URL |
-| 全文搜尋 | `api/v1.0/search/?Keywords=關鍵字` | 全文檢索 |
-| 搜尋建議 | `api/v1.0/searchbar?query=關鍵字&Lang=zh` | 搜尋自動完成 |
-
-詳細 API 文件請見：[TDM API 參考文件](docs/TDMDO/reference/TDM_API_Reference.md)
-
----
-
-## 📋 依賴清單
-
-| 套件 | 用途 |
-|---|---|
-| `requests` | HTTP API 呼叫 |
-| `flask` | Web 服務 |
-| `yt-dlp` | m3u8 影片下載加速 |
-| `ffmpeg`（系統工具） | 影片下載與裁剪 |
-| `python-telegram-bot`（可選） | Telegram 推送 |
-| `beautifulsoup4`（可選） | HTML 解析 |
-
-安裝所有依賴：
-```bash
-pip install -r .claude/skills/tdm/scripts/requirements.txt
-# （可選）Telegram 推送
-pip install python-telegram-bot
-```
-
----
-
-## 🧪 疑難排解
+## 疑難排解
 
 ### 下載失敗
 
-```
-請確認 ffmpeg 或 yt-dlp 已安裝且在系統 PATH 中
+確認至少有 ffmpeg 或 yt-dlp，並可由目前 PATH 執行：
+
+```bash
+ffmpeg -version
+yt-dlp --version
 ```
 
-### 影片無回應
+若是新聞下載，另確認 ID 為 6–7 位、新聞存在且 `data.detail.video` 非空。節目頁、直播頁或任意公開影片 URL 不屬於 CLI 已保證的新聞解析範圍。
 
-TDM API 無需登入，若無回應請確認網路可訪問 `https://www.tdm.com.mo`。
+### 裁剪不精確
+
+程式先執行包含 `-ss`、`-t`、`-avoid_negative_ts make_zero` 的 ffmpeg 命令；失敗後的 fallback 仍使用 `-ss` 與 `-t`。兩條命令都**沒有顯式指定 codec**，因此不要假定一定重新編碼、一定 stream copy，或一定精確到幀。實際輸出由來源格式、時間戳、影格率、取樣邊界及 ffmpeg 預設選擇決定。
 
 ### Telegram 推送失敗
 
-```
-確認已安裝 python-telegram-bot
-確認 .env 中 TG_TOKEN 和 TG_CHATID 正確
-Bot 需要是目標群組/頻道的管理員
+```text
+1. 確認已安裝 python-telegram-bot
+2. 確認 PUSH_ENABLED、TG_TOKEN、TG_CHATID
+3. 確認 Bot 有目標群組／頻道權限
+4. 遠端媒體推送時，確認同名檔案已在 Server TDM_DOWNLOAD_DIR
 ```
 
 ### WebDAV 推送失敗
 
-```
-確認 Alist 後台用戶已勾選「WebDAV 讀寫」權限
-確認 WEBDAV_URL 可正常訪問
+```text
+1. 確認 WEBDAV_ENABLED=true 且 URL／帳密完整
+2. 確認帳號有 WebDAV 讀寫權限
+3. 確認目標目錄存在
+4. 優先把配置放在 .claude/skills/tdm/.env
 ```
 
-### 裁剪不精確
+### 遠端 401
 
-裁剪預設走重新編碼以確保精確到幀。若需極速無損裁剪（僅關鍵幀級別），可手動使用 `-c copy` 參數。
+確認 Server 的 `WEB_AUTH_ENABLED=true`、`WEB_AUTH_PASSWORDS` 已配置，且 Client `TDM_SERVER_PASSWORD` 精確匹配其中一個值。請勿把 TDM 網站會員密碼用作這項配置。
 
 ---
 
-## 📁 已下載目錄結構
+## 參考資料
 
-所有影片儲存在 `TDM_DOWNLOAD_DIR`（預設 `downloads/`）：
-```
-downloads/
-├── 1217791_世界盃16強_葡萄牙_0-1_西班牙.mp4    # 原片
-├── 1217791_世界盃16強_葡萄牙_0-1_西班牙_cut_00-00-20.000_00-00-50.000.mp4  # 裁剪版
-├── 1217866_氣象局料今明兩日仍有大驟雨及雷暴.mp4
-└── ...
-```
+- [TDM API 正式 Reference（唯一詳細文件）](docs/TDMDO/reference/TDM_API_Reference.md)
+- [TDM 網站 API 快速導讀](.claude/skills/tdm/references/tdm-site-reference.md)
+- [現行 CLI／遠端使用範例](.claude/skills/tdm/examples/example-usage.md)
+- [TDM Skill 定義](.claude/skills/tdm/SKILL.md)
 
 ---
 
-## 📄 授權
+## 授權
 
-專案為私有工具，僅供學習與個人使用。使用時請遵守 TDM 網站服務條款。
-
----
-
-> 更多細節請參閱：
-> - [CLI 使用範例](.claude/skills/tdm/examples/example-usage.md)
-> - [TDM API 參考](.claude/skills/tdm/references/tdm-site-reference.md)
-> - [TDM API 調研檔案](docs/TDMDO/reference/TDM_API_Reference.md)
+專案為私有工具，僅供學習與個人使用。使用時請遵守 TDM 網站服務條款與內容授權規範。

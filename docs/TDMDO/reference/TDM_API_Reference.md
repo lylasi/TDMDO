@@ -1,7 +1,7 @@
 # TDM (澳廣視) API 參考文檔
 
-> **最後更新**：2026-07-09
-> **調研方法**：Playwright 瀏覽器實際抓取 6 個頁面 + 直接 API 測試驗證
+> **最後更新**：2026-07-12
+> **調研方法**：原有 Playwright 頁面抓取與直接 API 測試，加上 2026-07-12 公開頁面、網路請求及 HLS manifest 追加驗證
 > **基準網站**：`https://www.tdm.com.mo/zh-hant/`
 
 ---
@@ -30,7 +30,7 @@
 
 ### 1.1 認證
 
-**全部 API 無需登入、無需 Cookie、無需 JS 渲染**。直接 HTTP GET 即可。
+本文所列新聞、節目、直播、搜尋、專題與微視頻等公開內容 API 無需登入、無需 Cookie、無需 JS 渲染，可直接 HTTP GET。`member/*` 等會員功能例外，可能要求登入。
 
 ### 1.2 基礎 URL
 
@@ -60,12 +60,13 @@ HEADERS = {
 
 ### 1.5 語言參數
 
-| Lang 值 | 語言 |
-|---------|------|
-| `zh` | 簡體中文（部分頁面預設） |
-| `zh-hant` | 繁體中文（詳情頁、側欄） |
-| `pt` | 葡萄牙文 |
-| `en` | 英文 |
+| Lang 值 | 語言 | 已確認的 `locale` |
+|---------|------|-------------------|
+| `zh` / `zh-hant` | 繁體中文（依端點及頁面用法而異） | `zh_TW` |
+| `pt` | 葡萄牙文 | `pt_PT` |
+| `en` | 英文 | `en` |
+
+新聞 API 已實測上述語言與 `locale` 對應；全文搜尋 `/api/v1.0/search/` 的 `Lang` 控制行為尚未確認。
 
 ### 1.6 新聞分類 ID
 
@@ -91,7 +92,7 @@ HEADERS = {
 | 參數 | 型別 | 必填 | 預設值 | 可選值 | 說明 |
 |------|------|------|--------|--------|------|
 | `Type` | string | 否 | — | `image` / `all_detail` / `all` | **關鍵參數**。`image`=卡片模式(含縮圖)；`all_detail`=列表細節模式，**`IsVideo` 過濾僅在此模式生效** |
-| `IsShowSevenDay` | string | 否 | — | `true` / `false` | ⚠️ **僅設 `true` 才有完整結果**。設 `false` 或不傳反而更少（只回當天） |
+| `IsShowSevenDay` | string | 否 | — | `true` / `false` | 抽樣中設 `true` 會回傳較多近期資料；`false` 或不傳時結果較少，但 `true` 亦不代表可取得完整歷史。 |
 | `IsVideo` | string | 否 | — | `true` / `false` | 僅 `Type=all_detail` 時生效。`true`=僅影片、`false`=僅文字、不傳=全部 |
 | `Category` | string | 否 | `""` | `""` / `27` / `41` / `42` / `143` | 分類 ID（數字） |
 | `Date` | string | 否 | `""` | `YYYY-MM-DD` | 日期過濾 |
@@ -133,7 +134,7 @@ GET /api/v1.0/news?IsShowSevenDay=true&Type=all_detail&IsVideo=true&SpecialId=&C
 | `all_detail` | `true` | `27` | `true` | 135 |
 | `all_detail` | `false` | — | `true` | 238 |
 
-> ⚠️ `IsShowSevenDay` 設 `false` 或不傳時，回傳數量反而比 `true` 少（只回今天），這是 TDM API 的已知行為。
+> ⚠️ 2026-07-09 抽樣中，`IsShowSevenDay=false` 或不傳時回傳數量明顯少於 `true`；此參數只能描述抽樣窗口差異，不能視為完整歷史資料開關。
 
 #### 回應結構
 
@@ -207,7 +208,7 @@ GET /api/v1.0/news?IsShowSevenDay=true&Type=all_detail&IsVideo=true&SpecialId=&C
 | `item.content` | HTML 格式內文 |
 | `item.date` | 格式 `MM/DD/YYYY HH:MM:SS` |
 | `item.category` | 數字分類 ID |
-| `item.video` | 空字串 = 純文字；非空 = m3u8 URL（含 `/play` 而非 `/playelist`） |
+| `item.video` | 空字串 = 無影片；非空 = API 回傳的影片播放或 HLS URL。官方 manifest 可使用 `playelist.m3u8` 拼字。 |
 | `item.shareUrl` | 分享連結 |
 | `item.cover` | 縮圖 URL |
 
@@ -236,7 +237,7 @@ GET /api/v1.0/news/categories
 
 ### 3.1 `GET /api/v1.0/news/{id}` — 新聞詳情
 
-取得單篇新聞完整內容（含影片 m3u8）。
+取得單篇新聞完整內容，可能同時包含影片、音訊及多張圖片。
 
 #### 官網實際請求
 
@@ -262,15 +263,27 @@ GET /api/v1.0/news/1218364?SpecialId=&id=1218364&Lang=zh-hant&Date=&Category=&Ty
   "code": 200,
   "data": {
     "detail": {
-      "id": 1218364,
-      "title": "14個8年期的士牌開標  最快料明年次季分批投運",
+      "id": 1218429,
+      "title": "新聞標題",
       "content": "<p>HTML 格式完整內文</p>",
       "date": "07/09/2026 10:53:00",
       "category": 27,
-      "video": "https://vod3.tdm.com.mo/newweb/_definist_/mp4:news_cn_20260709/xxx.mp4/playelist.m3u8",
+      "video": "",
+      "audio": "https://vod3.tdm.com.mo/newweb/_definist_/mp3:.../playelist.m3u8",
+      "images": [
+        {
+          "file": "https://cdn2.tdm.com.mo/...",
+          "title": "圖片標題或說明"
+        }
+      ],
+      "iconIndicator": {
+        "isAudio": true,
+        "isImage": true,
+        "isVideo": false
+      },
       "videoLength": 0,
-      "videoThumb": "https://cdn2.tdm.com.mo/...",
-      "shareUrl": "https://www.tdm.com.mo/zh-hant/sharelink/news/1218364",
+      "videoThumb": "",
+      "shareUrl": "https://www.tdm.com.mo/zh-hant/sharelink/news/1218429",
       "createdAt": "2026-07-09T10:53:00",
       "cover": "https://cdn2.tdm.com.mo/...",
       "tags": [],
@@ -285,7 +298,19 @@ GET /api/v1.0/news/1218364?SpecialId=&id=1218364&Lang=zh-hant&Date=&Category=&Ty
 }
 ```
 
-> **m3u8 轉換規則**：若 `video` 欄位含 `/play` 而非 `/playelist`，需替換為 `/playelist.m3u8`。例如 `/xxx.mp4/play` → `/xxx.mp4/playelist.m3u8`
+**媒體欄位判定**：
+
+| 欄位 | 說明 |
+|------|------|
+| `video` | 非空時為新聞影片 HLS URL。官方路徑可使用拼字 `playelist.m3u8`。 |
+| `audio` | 非空時為新聞音訊 HLS URL；實測新聞 `1218429` 使用 TDM `vod3` 的 MP3 HLS `.../playelist.m3u8`。 |
+| `images[]` | 完整圖片集合；每項至少可見 `file`（圖片 URL）與 `title`（標題或說明）。 |
+| `cover` | 卡片或內容封面，不等於 `images[]` 的完整圖片集合。 |
+| `iconIndicator.isAudio` | 是否含音訊。 |
+| `iconIndicator.isImage` | 是否含圖片集合。 |
+| `iconIndicator.isVideo` | 是否含影片。 |
+
+同一新聞可同時包含多種媒體，不能以單一 `type` 或只檢查 `cover` 判定。實測新聞 `1218429` 同時有 `audio` 與 `images[]`，屬 mixed media。
 
 ### 3.2 `GET /api/v1.0/news/{id}/relation` — 相關新聞
 
@@ -326,44 +351,31 @@ GET /api/v1.0/search/?Keywords=澳門&SelectType=search_news&Page=1&PageSize=15&
 | `FullSearch` | `true` | 全文搜索 |
 | `DateSort` | `true` | 按日期排序 |
 
-#### 回應結構
+#### 回應結構與分頁
 
 ```json
 {
   "code": 0,
   "data": {
     "count": 126438,
-    "items": [
-      {
-        "id": 1218384,
-        "title": "新聞標題",
-        "content": "HTML 內容",
-        "date": "07/09/2026 12:03:00",
-        "video": "",                    // ← 自帶 video 欄位！
-        "cover": "https://cdn...",
-        "type": "news",
-        "path": null,
-        "url": null,
-        "channelType": null,
-        "programType": null,
-        "playlistId": null,
-        "slug": null,
-        "newWindow": false,
-        "infoId": null,
-        "headTitle": null,
-        "iconIndicator": null,
-        "collectCount": 0,
-        "likeCount": 0,
-        "commentCount": 0,
-        "viewCount": 0,
-        "audio": null
-      }
-    ]
+    "pageCount": 8429,
+    "items": []
   }
 }
 ```
 
-> ⚠️ **重要**：search API 回傳的每條 item **已自帶 `video` 欄位**。過濾影片新聞時直接檢查 `item.video` 是否非空即可，**不需要**再對每個 ID 調用 `/news/{id}` 檢查。
+`data.count` 是符合條件的總數，`data.pageCount` 是總頁數；實際 item 欄位隨 `SelectType` 改變。
+
+#### 四類搜尋結果差異
+
+| `SelectType` | 已確認的結果特徵 |
+|--------------|------------------|
+| `search_news` | `type=news`；包含 `id/title/content/date/video/audio/cover/iconIndicator/viewCount` 等新聞欄位。 |
+| `search_program` | 包含 `slug`、`video`、`audio`、`programType`、`channelType`；詳情應使用節目 slug 契約。 |
+| `search_short_video` | `type=SHORTVIDEO`，item 直接回傳 `video`。 |
+| `search_pressrelease` | `type=PRESSRELEASE`，包含 `cover/title/content/date/viewCount`。 |
+
+`search_news` item 已自帶 `video`，過濾影片新聞時可直接檢查是否非空，無需逐項再請求 `/news/{id}`。但四類結果的 ID、slug 與資源契約不同，item URL 或 ID **不能一律拼成** `/news-detail/{id}`。全文搜尋的 `Lang` 控制行為尚未確認。
 
 ---
 
@@ -374,7 +386,7 @@ GET /api/v1.0/search/?Keywords=澳門&SelectType=search_news&Page=1&PageSize=15&
 #### 官網實際請求
 
 ```text
-# 節目表頁 — 全部節目
+# 節目入口 — 全部節目
 GET /api/v1.0/program?Type=all&Page=1&Lang=zh&CategoryType=&PageSize=13&PreRecordAd=6&Slug=program_list
 
 # 首頁 — TV 節目
@@ -390,37 +402,128 @@ GET /api/v1.0/program?Type=radio&PreRecordAd=4&PageSize=4
 |------|------|------|
 | `Type` | `all` | `tv` / `radio` / `all` |
 | `Page` | `1` | ≥1 |
-| `PageSize` | `13` | 1~N（首頁 TV=6, Radio=4） |
+| `PageSize` | `13` | 1~N（首頁 TV=6、Radio=4） |
 | `Lang` | `zh` | 語言 |
 | `CategoryType` | `""` | 子分類 |
 | `Slug` | `program_list` | 頁面標識 |
 | `PreRecordAd` | `6` | 前置廣告 |
 
-#### 回應結構
+回應使用 `header/newsList/adIds/total/currentItemCount/currentPage` 容器；節目 item 可包含 slug，後續詳情應以 slug 為主。
+
+### 5.2 節目 slug 詳情契約
+
+`/api/v1.0/program/{numeric_id}` **不是目前可靠的主要詳情契約**：2026-07-12 抽樣實測會回 `data: null`，對應舊頁亦可能 404。現行節目頁應使用下列 slug 端點；已以電視節目 `good_morning_macau` 與電台節目 `ChillClass_Radio` 驗證。
+
+#### 5.2.1 `GET /api/v1.0/program/{slug}/details` — 節目主檔
+
+```text
+GET /api/v1.0/program/good_morning_macau/details
+GET /api/v1.0/program/ChillClass_Radio/details
+```
+
+| 路徑參數 | 說明 |
+|----------|------|
+| `slug` | 節目永久識別字；大小寫依 API 回傳值使用。 |
+
+`data` 已確認的主要欄位：
+
+| 欄位 | 說明 |
+|------|------|
+| `id` | 節目主檔 ID。 |
+| `slug` | 節目 slug。 |
+| `title` | 節目名稱。 |
+| `cover` | 節目封面。 |
+| `content` | 節目介紹，可能為 HTML。 |
+| `playDesc` | 播出說明。 |
+| `channels` | 所屬電視或電台頻道資訊。 |
+| `programHosts` | 主持人陣列。 |
+| `hasReview` | 是否有節目重溫。 |
+| `isCanReview` | 目前是否允許重溫。 |
+| `interVerLimit` | 國際版或地區觀看限制標記。 |
+| `interVerDeadline` | 國際版觀看期限。 |
+| `noLive` | 不提供直播的限制標記。 |
+| `remark` | 其他備註或限制說明。 |
+
+#### 5.2.2 `GET /api/v1.0/program/{slug}/feature` — 節目特色內容
+
+```text
+GET /api/v1.0/program/good_morning_macau/feature?slug=good_morning_macau
+GET /api/v1.0/program/ChillClass_Radio/feature?slug=ChillClass_Radio
+```
+
+| 參數 | 必填 | 說明 |
+|------|------|------|
+| path `slug` | 是 | 節目 slug。 |
+| query `slug` | 官網有傳 | 與 path slug 相同。 |
+
+回應為該節目的 feature 資料；內容與數量依節目配置，可能為空。
+
+#### 5.2.3 `GET /api/v1.0/program/{slug}/review` — 節目重溫
+
+```text
+GET /api/v1.0/program/good_morning_macau/review?resource=good_morning_macau&Page=1&DateDesc=true&ViewTotalDesc=false&preRecordAd=0&Date=
+GET /api/v1.0/program/ChillClass_Radio/review?resource=ChillClass_Radio&Page=1&DateDesc=true&ViewTotalDesc=false&preRecordAd=0&Date=
+```
+
+| 參數 | 預設/實測值 | 說明 |
+|------|-------------|------|
+| path `slug` | 必填 | 節目 slug。 |
+| `resource` | 同 slug | 官網請求使用的節目資源識別字。 |
+| `Page` | `1` | 頁碼。 |
+| `DateDesc` | `true` | 按日期遞減。 |
+| `ViewTotalDesc` | `false` | 是否按觀看數遞減。 |
+| `preRecordAd` | `0` | 前置廣告配置。 |
+| `Date` | `""` | 日期過濾。 |
+
+#### review 回應層級
 
 ```json
 {
   "code": 0,
   "data": {
-    "header": { ... },
-    "newsList": [ ... ],
-    "adIds": [],
-    "total": 381,
-    "currentItemCount": 13,
-    "currentPage": 1
+    "count": 980,
+    "page": 1,
+    "pageCount": 82,
+    "items": [
+      {
+        "date": "2026-07-11",
+        "shareUrl": "https://www.tdm.com.mo/zh-hant/sharelink/program/good_morning_macau?s=pc&type=all&category=video&date=2026-07-11",
+        "items": [
+          {
+            "id": 407929,
+            "images": [],
+            "items": [
+              {
+                "id": 569716,
+                "video": "https://vod3.tdm.com.mo/.../Hand20260711.mp4/playelist.m3u8",
+                "radio": "",
+                "cover": "https://cdn2.tdm.com.mo/...",
+                "episodeId": 407929,
+                "programHosts": [],
+                "radioLength": 0
+              }
+            ]
+          }
+        ]
+      }
+    ]
   }
 }
 ```
 
-結構與新聞列表相同（共用 `newsList` 容器格式）。
+實際容器層級是 `data.items[]`（日期群組）→ `items[]`（集數）→ `items[]`（可播放片段）：
 
-### 5.2 `GET /api/v1.0/program/{id}` — 節目詳情
+- 日期群組：`date`、`shareUrl`。
+- 集數：`id`、`images[]`。
+- 片段：`id`、`video`、`radio`、`cover`、`episodeId`、`programHosts[]`、`radioLength`。
 
-```text
-GET /api/v1.0/program/850015
-```
+ID 語義必須區分：
 
-回應結構與 `GET /api/v1.0/news/{id}` 相同（`data.detail.*`），含 `video` 欄位。
+- **節目主檔 ID**：`details.id`，識別整個節目。
+- **集數 ID**：第二層 `items[].id`。
+- **片段 ID**：第三層 `items[].id`；其 `episodeId` 指回所屬集數。
+
+三者不是同一 ID，不能互相替代。電台節目的同一結構會以 `radio` 提供音訊 HLS；實測 `ChillClass_Radio` 音訊 manifest 使用 `mp3:attachment/...mp3/playelist.m3u8`。
 
 ### 5.3 `GET /api/v1.0/program/categories` — 節目分類
 
@@ -428,13 +531,60 @@ GET /api/v1.0/program/850015
 GET /api/v1.0/program/categories?Type=all
 ```
 
-### 5.4 `GET /api/v1.0/program-list/Channel` — 頻道清單
+### 5.4 現行節目表 API（`program-list`）
+
+#### 5.4.1 `GET /api/v1.0/program-list/Channel` — 頻道清單
 
 ```text
 GET /api/v1.0/program-list/Channel?type=tv
+GET /api/v1.0/program-list/Channel?type=radio
 ```
 
-回傳頻道列表（直播頁使用）。
+| 參數 | 可選值 | 說明 |
+|------|--------|------|
+| `type` | `tv` / `radio` | 頻道類型。 |
+
+#### 5.4.2 `GET /api/v1.0/program-list/categories` — 節目表分類
+
+```text
+GET /api/v1.0/program-list/categories?channelId=0
+```
+
+| 參數 | 實測值 | 說明 |
+|------|--------|------|
+| `channelId` | `0` | `0` 表示未限定特定頻道。 |
+
+回應提供可查日期，已確認欄位包括：
+
+```json
+{
+  "day": 12,
+  "week": "日",
+  "title": "12/7 (星期日)",
+  "date": "2026-07-12"
+}
+```
+
+#### 5.4.3 `GET /api/v1.0/program-list/{date}` — 指定日期節目表
+
+```text
+# 澳視澳門 91 台
+GET /api/v1.0/program-list/2026-07-12?date=2026-07-12&type=tv&channelId=1
+
+# 澳門電台 FM100.7
+GET /api/v1.0/program-list/2026-07-12?date=2026-07-12&type=radio&channelId=3
+```
+
+| 參數 | 說明 |
+|------|------|
+| path `date` | `YYYY-MM-DD`。 |
+| query `date` | 官網同時傳入的 `YYYY-MM-DD`。 |
+| `type` | `tv` 或 `radio`。 |
+| `channelId` | 頻道 ID；空值表示未限定。 |
+
+節目表 item 已確認欄位：`id`、`programmeId`、`slug`、`episodeId`、`type`、`programType`、`date`、`title`、`isLive`、`isReview`、`onlineFeed`、`isNews`、`episodeItemId`、`livePhoto`、`channelBackground`、`programLang`。
+
+`date` 表示節目開始時間。API item **沒有原始 `end` 欄位**；結束時間可由下一節目的開始時間推導，但推導值不屬於 API 原始回應。
 
 ---
 
@@ -442,7 +592,7 @@ GET /api/v1.0/program-list/Channel?type=tv
 
 ### 6.1 `GET /api/v1.0/live/categories` — 直播分類
 
-回傳直播頻道分類與頻道資訊（含 logo、簡介）。
+回傳電視與電台分類及完整頻道資訊。實測電視頻道包括「澳視澳門 91台」，電台包括「澳門電台 FM100.7」。
 
 ```text
 GET /api/v1.0/live/categories
@@ -456,14 +606,21 @@ GET /api/v1.0/live/categories
     "channelInfo": [
       {
         "id": 1,
-        "logo": "https://cdn2.tdm.com.mo/uploads/attachment/2021-03/...png",
+        "logo": "https://cdn2.tdm.com.mo/...png",
         "title": "澳視澳門 91台",
-        "intro": "<p>頻道簡介 HTML</p>"
+        "intro": "<p>頻道簡介 HTML</p>",
+        "onlineFeed": "https://live3.tdm.com.mo/ch1/ch1.live/playlist.m3u8",
+        "liveProgramName": "目前直播節目名稱",
+        "slug": "ctvp",
+        "chatUUID": "聊天室識別字",
+        "appKey": "聊天室應用識別字"
       }
     ]
   }
 ]
 ```
+
+`channelInfo` 已確認欄位包括 `onlineFeed/liveProgramName/slug/chatUUID/appKey`；`onlineFeed` 是頻道目前提供的直播 HLS URL。電台樣本 `id=3`、`title=澳門電台 FM100.7`、`slug=fm1007`，串流為 `https://live3.tdm.com.mo/live/rch2a.live/playlist.m3u8`。
 
 ### 6.2 `GET /api/v1.0/live/{id}/playlist` — 直播播放清單
 
@@ -483,11 +640,13 @@ GET /api/v1.0/common/special-live?slug=web_home&type=web
 
 ### 6.4 直播 m3u8 URL
 
-```
-https://globallive.tdm.com.mo/ch1/ch1.live/playlist.m3u8
+2026-07-12 公開 API 的 `channelInfo.onlineFeed` 實測以 `live3.tdm.com.mo` URL 為準，例如：
+
+```text
+https://live3.tdm.com.mo/.../playlist.m3u8
 ```
 
-域名可透過 `/api/v1/common/get-domain` 動態獲取。
+`/api/v1/common/get-domain` 仍可回傳 `live3` 至其他直播域名的映射；實際播放入口應優先採用當次 API 回傳的 `onlineFeed`，而不是硬編固定域名。
 
 ---
 
@@ -620,6 +779,23 @@ GET /api/v1.0/common/message-template?slug=cookies_content
 
 Cookie 同意彈窗內容。
 
+### 9.6 分享 URL
+
+API 物件可直接回傳 `shareUrl`，已確認格式包括：
+
+```text
+# 新聞
+https://www.tdm.com.mo/zh-hant/sharelink/news/1218429
+
+# 電視節目重溫
+https://www.tdm.com.mo/zh-hant/sharelink/program/good_morning_macau?s=pc&type=all&category=video&date=2026-07-11
+
+# 電台節目重溫
+https://www.tdm.com.mo/zh-hant/sharelink/program/ChillClass_Radio?s=pc&type=all&category=radio&date=2026-07-10
+```
+
+節目分享 URL 以節目 slug、媒體類型及日期定位，不應自行改拼成 numeric item URL。分享入口應優先使用各 API item 實際回傳的 `shareUrl`；分享頁 HTML 並非取得資源詳情或媒體 URL 的穩定契約。
+
 ---
 
 ## 10. 廣告
@@ -644,17 +820,109 @@ GET /api/v1.0/advertisement?slug=home_program_3       // 首頁節目 3
 
 ## 11. 其他 API
 
-### 11.1 `GET /api/v1.0/short-video/category` — 微視頻分類
+### 11.1 微視頻（short-video）
+
+#### 11.1.1 `GET /api/v1.0/short-video/category` — 微視頻分類
 
 ```text
 GET /api/v1.0/short-video/category
 ```
 
-### 11.2 `GET /api/v1.0/special` — 專題頁面
+已確認分類 ID：
+
+| ID | 名稱 |
+|----|------|
+| `441` | 即日要聞 |
+| `407` | 故事 |
+| `410` | 新知 |
+| `413` | 潮玩 |
+| `415` | 特派員 |
+
+#### 11.1.2 `GET /api/v1.0/short-video` — 微視頻列表
+
+```text
+GET /api/v1.0/short-video?Page=1&PageSize=3&Category=&Lang=zh
+GET /api/v1.0/short-video?Page=1&PageSize=3&Category=441&Lang=zh
+```
+
+| 參數 | 預設/實測值 | 說明 |
+|------|-------------|------|
+| `Page` | `1` | 頁碼。 |
+| `PageSize` | `3` | 每頁筆數。 |
+| `Category` | `""` | 空值為全部，或傳分類 ID。 |
+| `Lang` | `zh` | 語言。 |
+
+```json
+{
+  "code": 0,
+  "data": {
+    "newsList": [],
+    "total": 0,
+    "currentPage": 1,
+    "currentItemCount": 0
+  }
+}
+```
+
+`GET /api/v1.0/short-video/{id}` 抽樣回 404；獨立 detail 契約尚未確認，不能假定列表 ID 可套用該路徑。
+
+### 11.2 專題（special）
+
+#### 11.2.1 `GET /api/v1.0/special` — 專題列表
 
 ```text
 GET /api/v1.0/special?Slug=special_site1
 ```
+
+回應包含 `data.lists[]` 與 `data.total`；列表 item 已確認欄位包括 `id/title/slug/cover/banner/openVote/openComments/tags/activityStartAt/activityEndAt`。
+
+已以專題 slug `FIFA2026` 驗證現行專題頁與下列關聯 API。
+
+#### 11.2.2 `GET /api/v1.0/special/{slug}` — 專題主檔
+
+```text
+GET /api/v1.0/special/FIFA2026
+```
+
+| 路徑參數 | 說明 |
+|----------|------|
+| `slug` | 專題 slug，例如 `FIFA2026`。 |
+
+回傳指定 slug 的專題主檔；新聞、關聯節目與節目重溫分別使用下列獨立端點。專題列表中已確認的 `id/title/slug/cover/banner/openVote/openComments/tags/activityStartAt/activityEndAt` 可用於定位及展示主檔。
+
+#### 11.2.3 `GET /api/v1.0/special/{slug}/related-program` — 關聯節目
+
+```text
+GET /api/v1.0/special/FIFA2026/related-program
+```
+
+回傳專題關聯節目資料；節目識別與詳情仍依第 5 章的 slug 契約。
+
+#### 11.2.4 `GET /api/v1.0/special/{slug}/program-review` — 專題節目重溫
+
+```text
+GET /api/v1.0/special/FIFA2026/program-review?Page=1&PageSize=16
+```
+
+| 參數 | 實測值 | 說明 |
+|------|--------|------|
+| `Page` | `1` | 頁碼。 |
+| `PageSize` | `16` | 每頁筆數。 |
+
+#### 11.2.5 `GET /api/v1.0/special/{slug}/news` — 專題新聞
+
+```text
+GET /api/v1.0/special/FIFA2026/news?id=FIFA2026&Tag=&Page=1&PageSize=16
+```
+
+| 參數 | 實測值 | 說明 |
+|------|--------|------|
+| `id` | 同 slug | 官網以專題 slug 傳入。 |
+| `Tag` | `""` | 標籤過濾。 |
+| `Page` | `1` | 頁碼。 |
+| `PageSize` | `16` | 每頁筆數。 |
+
+專題新聞 item 已確認可包含 `video`、`audio`、`images`、`tags`、`shareUrl`、`iconIndicator`；同樣應依欄位組合判定 mixed media。
 
 ### 11.3 `GET /api/v1.0/member/playlist` — 會員播放清單
 
@@ -714,24 +982,9 @@ globalvod.tdm.com.mo        (點播)
 
 建議透過 `/api/v1/common/get-domain` 動態獲取最新域名映射。
 
-### 13.3 URL 轉換規則
+### 13.3 官方 URL 拼字與使用原則
 
-從 `GET /api/v1.0/news/{id}` 取得的 `video` 欄位，若含 `/play` 而非 `/playelist`：
-
-```python
-if m3u8 and "/play" in m3u8 and "/playelist" not in m3u8:
-    m3u8 = m3u8.replace("/play", "/playelist.m3u8")
-```
-
-### 13.4 下載
-
-```bash
-# yt-dlp (優先)
-yt-dlp --no-playlist -o output.mp4 "https://vod3.tdm.com.mo/.../playelist.m3u8"
-
-# ffmpeg (備用)
-ffmpeg -y -i "https://vod3.tdm.com.mo/.../playelist.m3u8" output.mp4
-```
+TDM 實際回傳的 HLS URL 可包含 `playelist.m3u8`。`playelist` 是官方現行 URL 的實際拼字，不能未經驗證自行改成 `playlist`。新聞、節目、音訊與直播均應優先使用當次 API 回傳的完整 URL；只有回應明確提供非 manifest 播放路徑時，才可依同一資源已驗證的 manifest 規則處理。
 
 ---
 
@@ -739,48 +992,46 @@ ffmpeg -y -i "https://vod3.tdm.com.mo/.../playelist.m3u8" output.mp4
 
 | # | 限制 | 說明 |
 |----|------|------|
-| 1 | **`IsShowSevenDay` 必須為 `true`** | 設 `false` 或不傳時回傳數量反而更少（只回今天）。這是 TDM API 的已知行為，無法透過 API 參數突破。 |
+| 1 | **`IsShowSevenDay=true` 不是歷史全量開關** | `false` 或不傳的抽樣結果較少；`true` 可取得較多近期資料，但不代表可取得全站歷史全量。 |
 | 2 | **`IsVideo` 僅在 `Type=all_detail` 時生效** | `Type=image` 模式下 `IsVideo` 參數被忽略。 |
 | 3 | **`Category` 是數字 ID** | 傳字串值（如 `"local"`）無效，必須傳數字（如 `"27"`）。 |
-| 4 | **Date 參數效果有限** | `Date` 參數在 `Type=image` 時有一定效果，但在 `Type=all_detail` 時效果不明顯。**
-| 5 | **歷史日期需要跨頁掃描** | 查詢歷史日期時，API 單頁只含少量結果，需跨多頁收集。 |
-| 6 | **`searchbar` API 已失效(404)** | TDM 網站搜尋欄不再使用此端點。 |
-| 7 | **無需認證** | 所有 API 均為公開，無需 Cookie、Token 或 JS 渲染。 |
-| 8 | **分頁上限** | API 約第 8-10 頁後回傳空資料，實際可取得約 300-400 篇。 |
+| 4 | **`Date` 參數效果有限** | `Date` 在 `Type=image` 時有一定效果，在 `Type=all_detail` 時效果不明顯。 |
+| 5 | **歷史日期需要跨頁檢查** | 單頁只含部分結果，且 `IsShowSevenDay` 不能視為歷史全量保證。 |
+| 6 | **`searchbar` API 已失效（404）** | TDM 網站搜尋欄目前不再使用此端點。 |
+| 7 | **公開與會員端點權限不同** | 本文主要公開內容 API 無需登入；`member/*` 等會員功能仍可能要求登入。 |
+| 8 | **搜尋四類契約不同** | 搜尋 item URL、ID 或 slug 不能一律當成新聞詳情；搜尋 `Lang` 控制尚未確認。 |
+| 9 | **numeric program endpoint 不可靠** | `/api/v1.0/program/{numeric_id}` 實測可回 `data:null`，舊 numeric 頁亦可能 404；主要契約是 `/program/{slug}/details|feature|review`。 |
+| 10 | **節目觀看受欄位限制** | `interVerLimit`、`interVerDeadline`、`noLive` 可能限制地區、期限、直播或重溫可用性。 |
+| 11 | **節目表只有開始時間** | item 的 `date` 是開始時間；`end` 可由下一筆開始時間推導，但不是原始 API 欄位。 |
+| 12 | **short-video detail 未確認** | `/short-video/{id}` 抽樣 404，不能宣稱存在穩定獨立詳情端點。 |
+| 13 | **字幕狀態未確認** | 目前未在抽樣 API 欄位發現字幕資料，抽樣 HLS manifest 亦未見 `SUBTITLES`；僅代表抽樣未發現，不能宣稱全站沒有字幕。 |
+| 14 | **官方 HLS 拼字不可任改** | `playelist.m3u8` 是已實測的官方 URL 拼字，不可自行正規化為 `playlist.m3u8`。 |
+| 15 | **媒體可混合存在** | `video/audio/images[]` 可同時出現；`cover` 不等於完整圖片集合，應配合 `iconIndicator` 與各媒體欄位判定。 |
+| 16 | **分頁可見資料有限** | 部分列表在較後頁面回空或受內容窗口限制，不能只憑單次分頁推定全站總可取範圍。 |
 
 ---
 
 ## 15. 頁面與 API 對照
 
-| 頁面 | URL 模式 | 調用的 API |
-|------|----------|-----------|
-| 首頁 | `/zh-hant` | `news`(Type=image,Slug=web_news_homepage,PageSize=12), `program`(Type=tv+radio), `special-live`, `weather-notify`, `advertisement`×N |
-| 新聞列表 | `/zh-hant/news-list?type=image&category=all&date=YYYY-MM-DD` | `news`(Type=image,Slug=news_list,PageSize=40), `news/categories`, `advertisement` |
-| 新聞詳情 | `/zh-hant/news-detail/{id}` | `news/{id}`(Type=all,Lang=zh-hant), `news/{id}/comment`, `news/{id}/relation`, `news`(側欄 Type=all_detail,IsVideo=false) |
-| 搜尋 | `/zh-hant/search?q=KEYWORD&type=news` | SSR 渲染，`search/?Keywords=...`, `search/fitler` |
-| 直播 | `/zh-hant/live?Channel=1&type=tv` | `live/categories`, `live/{id}/playlist`, `program-list/Channel` |
-| 節目表 | `/zh-hant/program/all_program` | `program`(Type=all,Slug=program_list), `program/categories` |
+| 頁面 | URL 模式 | 調用的現行 API |
+|------|----------|----------------|
+| 首頁 | `/zh-hant` | `news`（Type=image, Slug=web_news_homepage, PageSize=12）、`program`（Type=tv/radio）、`special-live`、`weather-notify`、`advertisement` |
+| 新聞列表 | `/zh-hant/news-list?type=image&category=all&date=YYYY-MM-DD` | `news`（Type=image, Slug=news_list, PageSize=40）、`news/categories`、`advertisement` |
+| 新聞詳情 | `/zh-hant/news-detail/{id}` | `news/{id}`、`news/{id}/comment`、`news/{id}/relation`、側欄 `news`（Type=all_detail） |
+| 搜尋 | `/zh-hant/search?q=KEYWORD&type=...` | `search/?Keywords=...&SelectType=...`、`search/fitler` |
+| 直播 | `/zh-hant/live?Channel={id}&type=tv|radio` | `live/categories`、`live/{id}/playlist`、`program-list/Channel` |
+| 節目入口 | `/zh-hant/program/all_program` | `program`（Type=all, Slug=program_list）、`program/categories` |
+| 電視節目 slug 頁 | `/zh-hant/program/playitem_video/{slug}?langarea=zh` | `program/{slug}/details`、`program/{slug}/feature`、`program/{slug}/review` |
+| 電台節目 slug 頁 | 站內電台節目頁（以頁面實際 slug 為準） | `program/{slug}/details`、`program/{slug}/feature`、`program/{slug}/review` |
+| 節目表 | 指定日期、類型與頻道的節目表頁 | `program-list/Channel?type=tv|radio`、`program-list/categories?channelId=0`、`program-list/{date}?date=&type=&channelId=` |
+| 微視頻 | `/zh-hant/short-video`（分類可由頁面狀態指定） | `short-video/category`、`short-video?Page=&PageSize=&Category=&Lang=` |
+| 專題 | `/zh-hant/special/{slug}` | `special/{slug}`、`special/{slug}/related-program`、`special/{slug}/program-review`、`special/{slug}/news` |
 
 ---
 
-## 附錄 A：本機程式碼映射
-
-| API | 代碼位置 |
-|-----|---------|
-| `api_news_list()` | `.claude/skills/tdm/scripts/tdm_core.py` |
-| `api_news_detail()` / `get_video_info()` | `.claude/skills/tdm/scripts/tdm_core.py` |
-| `api_search()` | `.claude/skills/tdm/scripts/tdm_core.py` |
-| `query_news_list()` | `.claude/skills/tdm/scripts/tdm_core.py` |
-| `query_search()` | `.claude/skills/tdm/scripts/tdm_core.py` |
-| `download_video()` / `trim_video()` | `.claude/skills/tdm/scripts/tdm_core.py` |
-| CLI 入口 | `.claude/skills/tdm/scripts/tdm_tool.py` |
-| Web 端 Flask 路由 | `app/tdm_web.py` |
-| 舊版採集器 | `TDM/data_collector.py` |
-| 舊版 URL 模板 | `TDM/config.py` |
-| Skill 定義 | `.claude/skills/tdm/` |
-
-## 附錄 B：變更記錄
+## 附錄：變更記錄
 
 | 日期 | 變更 |
 |------|------|
-| 2026-07-09 | 初始版本。Playwright 實測 6 頁面 + API 直測。Type=image/all_detail 差異、IsShowSevenDay 行為、Category 數字 ID、search API video 欄位、program/live/CMS/ad/common API 完整目錄 |
+| 2026-07-12 | 追加公開頁面、網路請求與 HLS manifest 驗證：新聞 audio/images/iconIndicator 與 mixed media；四類搜尋差異；節目 slug details/feature/review；現行 program-list；直播 channelInfo/live3；微視頻分類與列表；FIFA2026 專題 API；分享 URL、語言 locale、字幕與各項限制。修正 numeric program 詳情、`IsShowSevenDay`、節目表 end 與 `playelist` 拼字等舊說法。 |
+| 2026-07-09 | 初始版本。Playwright 實測 6 頁面 + API 直測。Type=image/all_detail 差異、IsShowSevenDay 行為、Category 數字 ID、search API video 欄位、program/live/CMS/ad/common API 完整目錄。 |
