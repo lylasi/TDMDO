@@ -37,6 +37,9 @@ Thumbs.db
 .claude/skills/*/.env
 .claude/skills/*/downloads/
 
+# ---- 跨代理 Skill 聯接（本機 junction，實際檔案在 .claude/skills）----
+.agents/skills/
+
 # ---- Playwright MCP 工作階段殘留 ----
 .playwright-mcp/
 

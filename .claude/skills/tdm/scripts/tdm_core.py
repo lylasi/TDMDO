@@ -22,9 +22,11 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, List, Callable, Any
+from urllib.parse import urlsplit, urlunsplit
 
 try:
     import requests as _requests
@@ -56,25 +58,36 @@ _PROJECT_ROOT = SKILL_DIR.parent.parent.parent  # 專案根（4層上）
 
 
 def load_env(env_dir: Path = None):
-    """載入 .env 到 os.environ（不覆蓋已存在的系統環境變數）。"""
-    if env_dir is None:
-        env_dir = SKILL_DIR
-    env_file = env_dir / ".env"
-    if not env_file.exists():
-        return
-    with open(env_file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k, v = k.strip(), v.strip().strip('"').strip("'")
-            if k and k not in os.environ:
-                os.environ[k] = v
+    """載入 .env 到 os.environ（不覆蓋已存在的環境變數）。
+    優先順序：系統環境變數 > 專案根目錄 .env > Skill 目錄 .env > 當前工作目錄 .env
+    """
+    targets = []
+    if env_dir is not None:
+        targets.append(Path(env_dir) / ".env")
+    else:
+        for candidate in [_PROJECT_ROOT / ".env", SKILL_DIR / ".env", Path.cwd() / ".env"]:
+            if candidate not in targets:
+                targets.append(candidate)
+
+    for env_file in targets:
+        if not env_file.exists():
+            continue
+        try:
+            with open(env_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip().strip('"').strip("'")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+        except OSError:
+            pass
 
 
-# 自動載入 skill 目錄下的 .env
-load_env(SKILL_DIR)
+# 自動按優先順序載入 .env
+load_env()
 
 if not _requests:
     raise ImportError("請安裝: pip install requests")
@@ -86,8 +99,20 @@ if not _requests:
 
 TDM_BASE   = "https://www.tdm.com.mo"
 API_BASE   = f"{TDM_BASE}/api/v1.0"
-DB_PATH    = Path(os.environ.get("TDM_DB_PATH", SKILL_DIR / "scripts" / "tdm_news.db"))
-DOWNLOAD_DIR = Path(os.environ.get("TDM_DOWNLOAD_DIR", SKILL_DIR / "downloads"))
+
+_raw_db = os.environ.get("TDM_DB_PATH", "").strip()
+if _raw_db:
+    _db_p = Path(_raw_db)
+    DB_PATH = _db_p if _db_p.is_absolute() else (_PROJECT_ROOT / _db_p).resolve()
+else:
+    DB_PATH = (SKILL_DIR / "scripts" / "tdm_news.db").resolve()
+
+_raw_dl = os.environ.get("TDM_DOWNLOAD_DIR", "").strip()
+if _raw_dl:
+    _dl_p = Path(_raw_dl)
+    DOWNLOAD_DIR = _dl_p if _dl_p.is_absolute() else (_PROJECT_ROOT / _dl_p).resolve()
+else:
+    DOWNLOAD_DIR = (SKILL_DIR / "downloads").resolve()
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 HEADERS = {
@@ -199,6 +224,75 @@ def _api_get(url: str, params: dict = None, timeout: int = 30) -> Optional[dict]
         return resp.json()
     except Exception:
         return None
+
+
+def _m3u8_candidates(url: str) -> List[str]:
+    """保留原始 HLS URL，並追加 TDM API 提供的影片 CDN 後備 URL。"""
+    if not url:
+        return []
+
+    candidates = [url]
+    try:
+        parsed = urlsplit(url)
+        current_origin = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+        hostname = (parsed.hostname or "").lower()
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return candidates
+        if "tdm.com.mo" not in hostname or "vod" not in hostname:
+            return candidates
+    except Exception:
+        return candidates
+
+    domain_response = _api_get(f"{TDM_BASE}/api/v1/common/get-domain") or {}
+    domain_data = domain_response.get("data", {})
+    if not isinstance(domain_data, dict):
+        return candidates
+
+    domains = domain_data.get("domains", {})
+    if not isinstance(domains, dict):
+        domains = {}
+
+    origins = []
+
+    def add_origin(origin: Any):
+        if not isinstance(origin, str) or not origin.strip():
+            return
+        origin = origin.strip().rstrip("/")
+        try:
+            origin_parts = urlsplit(origin)
+            origin_host = (origin_parts.hostname or "").lower()
+            if origin_parts.scheme not in ("http", "https") or not origin_parts.netloc:
+                return
+            if "tdm.com.mo" not in origin_host or "vod" not in origin_host:
+                return
+        except Exception:
+            return
+        if origin not in origins:
+            origins.append(origin)
+
+    mapped_origin = domains.get(current_origin)
+    add_origin(mapped_origin)
+    add_origin(domain_data.get("videoDomain"))
+    add_origin(domain_data.get("sourceVideoDomain"))
+    for source_origin, target_origin in domains.items():
+        add_origin(source_origin)
+        add_origin(target_origin)
+
+    for origin in origins:
+        try:
+            origin_parts = urlsplit(origin)
+            replacement = urlunsplit((
+                origin_parts.scheme,
+                origin_parts.netloc,
+                parsed.path,
+                parsed.query,
+                parsed.fragment,
+            ))
+        except Exception:
+            continue
+        if replacement not in candidates:
+            candidates.append(replacement)
+    return candidates
 
 
 def api_news_list(page: int = 1, page_size: int = 40,
@@ -787,6 +881,84 @@ def _get_ytdlp_cmd() -> List[str]:
     return ["python", "-m", "yt_dlp"]
 
 
+def _new_download_temp_path(output: str) -> Path:
+    """建立同目錄的唯一暫存輸出路徑，避免失敗檔案污染正式檔名。"""
+    output_path = Path(output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{output_path.stem}.tdm-",
+        suffix=output_path.suffix or ".mp4",
+        dir=str(output_path.parent),
+    )
+    os.close(fd)
+    Path(temp_path).unlink(missing_ok=True)
+    return Path(temp_path)
+
+
+def _remove_file(path: Path):
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _download_m3u8_with_fallback(
+    m3u8: str,
+    output: str,
+    cut_start: float = None,
+    cut_dur: float = None,
+    progress_callback: Callable = None,
+) -> bool:
+    """依序嘗試 TDM CDN，成功後才將暫存檔移到正式輸出路徑。"""
+    candidates = _m3u8_candidates(m3u8)
+    total = len(candidates)
+    for index, candidate in enumerate(candidates, 1):
+        temp_output = _new_download_temp_path(output)
+        try:
+            if progress_callback and total > 1:
+                progress_callback(
+                    "TDM CDN",
+                    -1,
+                    f"嘗試後備來源 {index}/{total}: {candidate}",
+                )
+
+            success = False
+            if _HAS_YTDLP and cut_start is None and cut_dur is None:
+                yt_cmd = _get_ytdlp_cmd() + [
+                    "--no-playlist", "-o", str(temp_output), candidate
+                ]
+                if progress_callback:
+                    progress_callback("📦 yt-dlp", 5, "$ " + " ".join(yt_cmd))
+                success = _run_ytdlp(yt_cmd, progress_callback)
+
+            if not success:
+                _remove_file(temp_output)
+                ff_cmd = [
+                    "ffmpeg", "-y",
+                    "-rw_timeout", "30000000",
+                    "-http_persistent", "0",
+                    "-reconnect", "1",
+                    "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "5",
+                ]
+                if cut_start is not None:
+                    ff_cmd += ["-ss", str(cut_start)]
+                ff_cmd += ["-i", candidate]
+                if cut_dur is not None:
+                    ff_cmd += ["-t", str(cut_dur)]
+                ff_cmd.append(str(temp_output))
+                if progress_callback:
+                    progress_callback("🎬 ffmpeg", 25, "$ " + " ".join(ff_cmd))
+                success = _run_ffmpeg(ff_cmd, progress_callback)
+
+            if success and temp_output.exists() and temp_output.stat().st_size > 0:
+                os.replace(str(temp_output), output)
+                return True
+        finally:
+            _remove_file(temp_output)
+    return False
+
+
 def _run_ffmpeg(cmd: List[str], progress_callback: Callable = None) -> bool:
     """執行 ffmpeg，每行輸出即時回調 callback(status: str, pct: int, line: str)。"""
     try:
@@ -899,25 +1071,13 @@ def download_video(news_id: str = None, url: str = "",
     success = False
 
     if m3u8:
-        # 策略 1: 無裁剪用 yt-dlp 直下（有裁剪直接 ffmpeg，確保精確到幀）
-        if _HAS_YTDLP and cut_start is None and cut_dur is None:
-            yt_cmd = _get_ytdlp_cmd() + ["--no-playlist", "-o", out, m3u8]
-            if progress_callback:
-                progress_callback("📦 yt-dlp", 5, "$ " + " ".join(yt_cmd))
-            success = _run_ytdlp(yt_cmd, progress_callback)
-
-        # 策略 2: yt-dlp 失敗、不可用、或有裁剪 → ffmpeg
-        if not success:
-            ff_cmd = ["ffmpeg", "-y"]
-            if cut_start is not None:
-                ff_cmd += ["-ss", str(cut_start)]
-            ff_cmd += ["-i", m3u8]
-            if cut_dur is not None:
-                ff_cmd += ["-t", str(cut_dur)]
-            ff_cmd.append(out)
-            if progress_callback:
-                progress_callback("🎬 ffmpeg", 25, "$ " + " ".join(ff_cmd))
-            success = _run_ffmpeg(ff_cmd, progress_callback)
+        success = _download_m3u8_with_fallback(
+            m3u8,
+            out,
+            cut_start=cut_start,
+            cut_dur=cut_dur,
+            progress_callback=progress_callback,
+        )
 
     if not success and url and not m3u8 and _HAS_YTDLP:
         yt_cmd = _get_ytdlp_cmd() + ["--no-playlist", "-o", out, url]

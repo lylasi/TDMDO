@@ -4,9 +4,9 @@
 [![Flask](https://img.shields.io/badge/Flask-3.x-000000)](https://flask.palletsprojects.com)
 [![ffmpeg](https://img.shields.io/badge/ffmpeg-required-green)](https://ffmpeg.org)
 
-> **使用說明同步：2026-07-12**
+> **使用說明同步：2026-09-14**
 >
-> TDMDO 以澳廣視（TDM）公開內容 API 為核心，提供 Web UI、CLI 與 Claude Code Skill，可查詢新聞、全文搜尋、下載及裁剪新聞影片，並支援 Telegram／WebDAV 推送與遠端模式。
+> TDMDO 以澳廣視（TDM）公開內容 API 為核心，提供 Web UI、CLI 與多 Agent Skill（Claude Code / DSH / Codex），可查詢新聞、全文搜尋、下載及裁剪新聞影片，並支援 Telegram／WebDAV 推送與遠端模式。
 
 ## 實作邊界
 
@@ -23,11 +23,14 @@
 
 ```text
 TDMDO/
+├── .env.example                     # 專案根目錄全域環境變數範例（推薦集中配置）
 ├── app/
 │   └── tdm_web.py                   # 獨立 Flask Web UI／遠端 Server
+├── .agents/skills/
+│   └── tdm/                         # 跨 Agent 技能軟鏈（Junction，供 DSH / Codex 調用）
 ├── .claude/skills/tdm/
-│   ├── SKILL.md                     # Claude Code Skill 定義與現行能力
-│   ├── .env.example                 # Skill／Server 環境變數範例
+│   ├── SKILL.md                     # Skill 核心定義與現行能力（實體真源）
+│   ├── .env.example                 # Skill 目錄環境變數範例（向下相容）
 │   ├── scripts/
 │   │   ├── tdm_core.py              # CLI／Web 共用核心
 │   │   ├── tdm_tool.py              # CLI 入口
@@ -39,12 +42,13 @@ TDMDO/
 │   └── examples/
 │       └── example-usage.md         # 現行可執行範例
 ├── docs/TDMDO/reference/
+│   ├── 20260914152857275_TDMDO配置與使用指南.md # 詳細 Web、Skill 與環境變數指南
 │   └── TDM_API_Reference.md         # 唯一詳細 TDM API 正式 Reference
 ├── CLAUDE.md
 └── README.md
 ```
 
-> 專案根目錄目前沒有 `.env.example`；可複製 `.claude/skills/tdm/.env.example` 為 `.claude/skills/tdm/.env`。
+> 推薦直接在專案根目錄複製 `.env.example` 為 `.env`（`cp .env.example .env`），Web 端與所有 Agent（Claude Code、DSH、Codex）均能自動統一生效。詳見 [`docs/TDMDO/reference/20260914152857275_TDMDO配置與使用指南.md`](docs/TDMDO/reference/20260914152857275_TDMDO配置與使用指南.md)。
 
 ---
 
@@ -101,13 +105,14 @@ ffmpeg -version
 ### `.env`
 
 ```bash
-cp .claude/skills/tdm/.env.example .claude/skills/tdm/.env
+# 推薦方式：在專案根目錄集中配置
+cp .env.example .env
 ```
 
 | 變數 | 預設值 | 適用範圍 | 說明 |
 |---|---|---|---|
-| `TDM_DOWNLOAD_DIR` | `<skill>/downloads` | CLI／Web core | 下載目錄 |
-| `TDM_DB_PATH` | `<skill>/scripts/tdm_news.db` | CLI／Web core | SQLite 路徑 |
+| `TDM_DOWNLOAD_DIR` | `<skill>/downloads` | CLI／Web core | 下載目錄（支援絕對路徑或相對於專案根目錄的相對路徑） |
+| `TDM_DB_PATH` | `<skill>/scripts/tdm_news.db` | CLI／Web core | SQLite 路徑（支援絕對路徑或相對於專案根目錄的相對路徑） |
 | `TDM_SERVER` | 無 | CLI | 遠端 Server URL |
 | `TDM_SERVER_PASSWORD` | 無 | 遠端 CLI | 必須匹配 Server `WEB_AUTH_PASSWORDS` 其中之一 |
 | `TDM_REMOTE_POLL_TIMEOUT` | `600` | 遠端 CLI | 下載進度輪詢總逾時秒數，必須大於 0 |
@@ -123,9 +128,15 @@ cp .claude/skills/tdm/.env.example .claude/skills/tdm/.env
 | `WEB_AUTH_ENABLED` | `false` | Web Server | 啟用 TDMDO 頁面與 API 密碼保護 |
 | `WEB_AUTH_PASSWORDS` | 無 | Web Server | 一個或多個逗號分隔密碼 |
 
-系統環境變數優先於 `.env`。CLI 與核心模組會可靠載入 `.claude/skills/tdm/.env`。
+#### 載入優先順序（由高至低）
 
-`app/tdm_web.py` 也會讀取**啟動時工作目錄**的 `.env`（不一定是專案根目錄），但它目前是**先 import `tdm_core`，再讀該 `.env`**；因此其中的 `TDM_DOWNLOAD_DIR`、`TDM_DB_PATH`、WebDAV 及通用推送配置在該次程序中不會改變已初始化的 core／push-manager 常數。請將這些配置放在 `.claude/skills/tdm/.env`。工作目錄 `.env` 只適合之後才讀取的 Web 認證等配置。
+1. **系統環境變數**（`os.environ`，永遠最高，不被檔案覆蓋）
+2. **專案根目錄 `.env`**（`<project_root>/.env`，最推薦，全域統一）
+3. **Skill 目錄 `.env`**（`.claude/skills/tdm/.env`，向下相容專用）
+4. **當前工作目錄 `.env`**（`Path.cwd()/.env`，保底）
+5. **程式內建預設值**（Default Fallback）
+
+Web 服務與 CLI 工具已完成統一，無論從根目錄直接配置或在 Skill 子目錄配置皆能精確生效。詳細使用指南請見 [`docs/TDMDO/reference/20260914152857275_TDMDO配置與使用指南.md`](docs/TDMDO/reference/20260914152857275_TDMDO配置與使用指南.md)。
 
 ---
 
@@ -379,7 +390,7 @@ python .claude/skills/tdm/scripts/tdm_tool.py --server http://192.168.1.100:8080
 
 ## WebDAV 自動推送
 
-在 `.claude/skills/tdm/.env` 設定：
+在專案根目錄 `.env`（或 `.claude/skills/tdm/.env`）設定：
 
 ```env
 WEBDAV_ENABLED=true
@@ -393,9 +404,14 @@ Alist／OpenAlist 帳號需有 WebDAV 讀寫權限，目標目錄亦須存在。
 
 ---
 
-## Claude Code Skill
+## Agent Skill（Claude Code / DSH / Codex）
 
-Skill 位於 `.claude/skills/tdm/`。在對話中提及 TDM、澳廣視、澳門新聞、新聞搜尋、新聞影片下載、裁剪或遠端模式，可觸發現行流程。
+Skill 實體定義位於 `.claude/skills/tdm/`，並透過 `.agents/skills/tdm` Junction 聯接實現跨 Agent 支援：
+- **Claude Code**：原生讀取 `.claude/skills/tdm`。
+- **DSH (DeepSeek Harness)**：自動發現專案級 `.agents/skills/tdm`（Rank 200）。
+- **Codex**：自動發現專案級 `.agents/skills` 目錄。
+
+在對話中提及 TDM、澳廣視、澳門新聞、新聞搜尋、新聞影片下載、裁剪或遠端模式，各 Agent 均可自動觸發現行流程。
 
 ```text
 使用者：查詢最新的 TDM 影片新聞
@@ -525,7 +541,7 @@ yt-dlp --version
 1. 確認 WEBDAV_ENABLED=true 且 URL／帳密完整
 2. 確認帳號有 WebDAV 讀寫權限
 3. 確認目標目錄存在
-4. 優先把配置放在 .claude/skills/tdm/.env
+4. 建議在專案根目錄 .env 集中配置（或使用 .claude/skills/tdm/.env）
 ```
 
 ### 遠端 401
@@ -536,6 +552,7 @@ yt-dlp --version
 
 ## 參考資料
 
+- [TDMDO 全域配置與使用指南（Web、Skills 與環境變數詳解）](docs/TDMDO/reference/20260914152857275_TDMDO配置與使用指南.md)
 - [TDM API 正式 Reference（唯一詳細文件）](docs/TDMDO/reference/TDM_API_Reference.md)
 - [TDM 網站 API 快速導讀](.claude/skills/tdm/references/tdm-site-reference.md)
 - [現行 CLI／遠端使用範例](.claude/skills/tdm/examples/example-usage.md)

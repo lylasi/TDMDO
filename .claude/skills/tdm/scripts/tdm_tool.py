@@ -37,6 +37,7 @@ except Exception:
 
 # ── CLI 前置驗證／環境載入 ───────────────────────────────
 _SKILL_DIR = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _ID_PATTERN = re.compile(r"^\d{6,7}$")
 _URL_ID_PATTERN = re.compile(r"(?<!\d)\d{6,7}(?!\d)")
 _CATEGORY_MAP = {
@@ -46,23 +47,23 @@ _CATEGORY_MAP = {
 
 
 def _load_skill_env() -> None:
-    """載入 skill/.env，保留系統環境變數的較高優先權。"""
-    env_file = _SKILL_DIR / ".env"
-    if not env_file.exists():
-        return
-    try:
-        with env_file.open("r", encoding="utf-8") as fh:
-            for raw_line in fh:
-                line = raw_line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                if key:
-                    os.environ.setdefault(key, value)
-    except OSError as exc:
-        print(f"警告: 無法讀取 {env_file}: {exc}", file=sys.stderr)
+    """載入 .env，優先順序：系統環境變數 > 專案根目錄 .env > skill/.env > 當前目錄 .env。"""
+    for env_file in [_PROJECT_ROOT / ".env", _SKILL_DIR / ".env", Path.cwd() / ".env"]:
+        if not env_file.exists():
+            continue
+        try:
+            with env_file.open("r", encoding="utf-8") as fh:
+                for raw_line in fh:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key:
+                        os.environ.setdefault(key, value)
+        except OSError as exc:
+            print(f"警告: 無法讀取 {env_file}: {exc}", file=sys.stderr)
 
 
 def _positive_int(value: str) -> int:

@@ -52,18 +52,25 @@ try:
 except Exception:
     pass
 
-# ── .env 載入（相容 CLI & 模組導入）──
-_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
-if _ENV_FILE.exists():
-    with open(_ENV_FILE, "r", encoding="utf-8") as _f:
-        for _line in _f:
-            _line = _line.strip()
-            if not _line or _line.startswith("#") or "=" not in _line:
-                continue
-            _k, _v = _line.split("=", 1)
-            _k, _v = _k.strip(), _v.strip().strip('"').strip("'")
-            if _k and _k not in os.environ:
-                os.environ[_k] = _v
+# ── .env 載入（優先順序：系統環境變數 > 專案根目錄 .env > skill/.env > 當前目錄 .env）──
+_CORE_FILE = Path(__file__).resolve()
+_SKILL_DIR = _CORE_FILE.parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
+
+for _env_file in [_PROJECT_ROOT / ".env", _SKILL_DIR / ".env", Path.cwd() / ".env"]:
+    if _env_file.exists():
+        try:
+            with open(_env_file, "r", encoding="utf-8") as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if not _line or _line.startswith("#") or "=" not in _line:
+                        continue
+                    _k, _v = _line.split("=", 1)
+                    _k, _v = _k.strip(), _v.strip().strip('"').strip("'")
+                    if _k and _k not in os.environ:
+                        os.environ[_k] = _v
+        except OSError:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════

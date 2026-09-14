@@ -43,9 +43,10 @@ except ImportError:
 app = Flask(__name__)
 _downloads: Dict[str, dict] = {}
 
-# ═══ 載入 .env 檔案（無相依套件）═══
-_ENV_DIR = Path(__file__).resolve().parent.parent / '.claude' / 'skills' / 'tdm'
-for _p in [_ENV_DIR / '.env', Path.cwd() / '.env']:
+# ═══ 載入 .env 檔案（優先順序：系統環境變數 > 專案根目錄 .env > Skill 目錄 .env > 當前目錄 .env）═══
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_SKILL_ENV_DIR = _PROJECT_ROOT / '.claude' / 'skills' / 'tdm'
+for _p in [_PROJECT_ROOT / '.env', _SKILL_ENV_DIR / '.env', Path.cwd() / '.env']:
     if _p.exists():
         with open(str(_p), encoding='utf-8') as _f:
             for _line in _f:
