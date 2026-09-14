@@ -16,9 +16,11 @@ TDMDO Core — 共用核心模組（CLI & Web 共用）。
 
 import concurrent.futures
 import html as _html_lib
+import importlib.util
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -57,9 +59,29 @@ SKILL_DIR  = _CORE_FILE.parent.parent          # .claude/skills/tdm
 _PROJECT_ROOT = SKILL_DIR.parent.parent.parent  # 專案根（4層上）
 
 
-def load_env(env_dir: Path = None):
-    """載入 .env 到 os.environ（不覆蓋已存在的環境變數）。
+def refresh_paths():
+    """根據當前環境變數重新計算並建立路徑。"""
+    global DB_PATH, DOWNLOAD_DIR
+    _raw_db = os.environ.get("TDM_DB_PATH", "").strip()
+    if _raw_db:
+        _db_p = Path(_raw_db)
+        DB_PATH = _db_p if _db_p.is_absolute() else (_PROJECT_ROOT / _db_p).resolve()
+    else:
+        DB_PATH = (SKILL_DIR / "scripts" / "tdm_news.db").resolve()
+
+    _raw_dl = os.environ.get("TDM_DOWNLOAD_DIR", "").strip()
+    if _raw_dl:
+        _dl_p = Path(_raw_dl)
+        DOWNLOAD_DIR = _dl_p if _dl_p.is_absolute() else (_PROJECT_ROOT / _dl_p).resolve()
+    else:
+        DOWNLOAD_DIR = (SKILL_DIR / "downloads").resolve()
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_env(env_dir: Path = None, override: bool = False):
+    """載入 .env 到 os.environ。
     優先順序：系統環境變數 > 專案根目錄 .env > Skill 目錄 .env > 當前工作目錄 .env
+    override: 是否強制用檔案設定覆蓋當前 os.environ
     """
     targets = []
     if env_dir is not None:
@@ -69,6 +91,7 @@ def load_env(env_dir: Path = None):
             if candidate not in targets:
                 targets.append(candidate)
 
+    loaded_keys = set()
     for env_file in targets:
         if not env_file.exists():
             continue
@@ -80,40 +103,29 @@ def load_env(env_dir: Path = None):
                         continue
                     k, v = line.split("=", 1)
                     k, v = k.strip(), v.strip().strip('"').strip("'")
-                    if k and k not in os.environ:
-                        os.environ[k] = v
+                    if not k:
+                        continue
+                    if override:
+                        if k not in loaded_keys:
+                            os.environ[k] = v
+                            loaded_keys.add(k)
+                    else:
+                        if k not in os.environ:
+                            os.environ[k] = v
         except OSError:
             pass
 
-
-# 自動按優先順序載入 .env
-load_env()
-
-if not _requests:
-    raise ImportError("請安裝: pip install requests")
+    refresh_paths()
 
 
-# ═══════════════════════════════════════════════════════════
-# 常數
-# ═══════════════════════════════════════════════════════════
-
+# 初始化路徑與基本常數
 TDM_BASE   = "https://www.tdm.com.mo"
 API_BASE   = f"{TDM_BASE}/api/v1.0"
+DB_PATH = (SKILL_DIR / "scripts" / "tdm_news.db").resolve()
+DOWNLOAD_DIR = (SKILL_DIR / "downloads").resolve()
 
-_raw_db = os.environ.get("TDM_DB_PATH", "").strip()
-if _raw_db:
-    _db_p = Path(_raw_db)
-    DB_PATH = _db_p if _db_p.is_absolute() else (_PROJECT_ROOT / _db_p).resolve()
-else:
-    DB_PATH = (SKILL_DIR / "scripts" / "tdm_news.db").resolve()
-
-_raw_dl = os.environ.get("TDM_DOWNLOAD_DIR", "").strip()
-if _raw_dl:
-    _dl_p = Path(_raw_dl)
-    DOWNLOAD_DIR = _dl_p if _dl_p.is_absolute() else (_PROJECT_ROOT / _dl_p).resolve()
-else:
-    DOWNLOAD_DIR = (SKILL_DIR / "downloads").resolve()
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+# 自動按優先順序載入 .env 並解析路徑
+load_env()
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -207,8 +219,14 @@ def check_cmd(cmd: str) -> bool:
     """檢查命令是否存在。"""
     try:
         parts = cmd.split()
-        subprocess.run(parts[:2] + ["--version"], capture_output=True, timeout=10)
-        return True
+        if not parts:
+            return False
+        if len(parts) == 1:
+            return shutil.which(parts[0]) is not None
+        if len(parts) >= 3 and parts[0] == "python" and parts[1] == "-m":
+            return importlib.util.find_spec(parts[2]) is not None
+        res = subprocess.run([parts[0], "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+        return res.returncode == 0
     except Exception:
         return False
 

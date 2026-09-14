@@ -1,6 +1,8 @@
+import shutil
 import sys
-import tempfile
 import unittest
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,6 +12,16 @@ SCRIPT_DIR = PROJECT_ROOT / ".claude" / "skills" / "tdm" / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import tdm_core  # noqa: E402
+
+
+@contextmanager
+def safe_temp_dir():
+    d = PROJECT_ROOT / "tmp" / f"test_{uuid.uuid4().hex[:8]}"
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        yield d
+    finally:
+        shutil.rmtree(str(d), ignore_errors=True)
 
 
 class TdmCdnFallbackTests(unittest.TestCase):
@@ -58,7 +70,7 @@ class TdmCdnFallbackTests(unittest.TestCase):
             )
             return input_url == backup
 
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with safe_temp_dir() as temp_dir:
             output_path = Path(temp_dir) / "1238553_video.mp4"
             with patch.object(tdm_core, "_HAS_FFMPEG", True), patch.object(
                 tdm_core, "_HAS_YTDLP", False
@@ -78,6 +90,8 @@ class TdmCdnFallbackTests(unittest.TestCase):
                 tdm_core, "_run_ffmpeg", side_effect=fake_ffmpeg
             ), patch.object(
                 tdm_core, "push_to_webdav", return_value=False
+            ), patch.object(
+                tdm_core, "push_to_channels", return_value={}
             ), patch.object(
                 tdm_core, "init_db"
             ), patch.object(
@@ -108,7 +122,7 @@ class TdmCdnFallbackTests(unittest.TestCase):
             command.extend(current_command)
             return False
 
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with safe_temp_dir() as temp_dir:
             output_path = Path(temp_dir) / "video.mp4"
             with patch.object(
                 tdm_core,

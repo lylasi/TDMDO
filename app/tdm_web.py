@@ -32,6 +32,7 @@ from tdm_core import (
     get_videos_by_news_id, get_grouped_videos, get_video_by_id,
     push_to_channels, is_push_available,
     get_db_stats, get_push_log, sync_latest_news,
+    load_env, refresh_paths, _HAS_FFMPEG, _HAS_YTDLP,
 )
 
 try:
@@ -43,33 +44,190 @@ except ImportError:
 app = Flask(__name__)
 _downloads: Dict[str, dict] = {}
 
-# ═══ 載入 .env 檔案（優先順序：系統環境變數 > 專案根目錄 .env > Skill 目錄 .env > 當前目錄 .env）═══
+# ═══ 載入 .env 檔案與系統參數配置 ═══
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _SKILL_ENV_DIR = _PROJECT_ROOT / '.claude' / 'skills' / 'tdm'
-for _p in [_PROJECT_ROOT / '.env', _SKILL_ENV_DIR / '.env', Path.cwd() / '.env']:
-    if _p.exists():
-        with open(str(_p), encoding='utf-8') as _f:
-            for _line in _f:
-                _line = _line.strip()
-                if not _line or _line.startswith('#') or '=' not in _line:
-                    continue
-                _key, _val = _line.split('=', 1)
-                _key, _val = _key.strip(), _val.strip().strip('"\'')
-                if _key and _val:
-                    os.environ.setdefault(_key, _val)
+_AUTH_ENABLED = False
+_AUTH_PASSWORDS_RAW = ""
+_AUTH_TOKENS = set()
 
-# ═══ Web 頁面密碼保護 ═══
-_AUTH_ENABLED = os.getenv("WEB_AUTH_ENABLED", "").lower() in ("1", "true", "yes")
-_AUTH_PASSWORDS_RAW = os.getenv("WEB_AUTH_PASSWORDS", "")
-_AUTH_TOKENS = set(
-    hashlib.sha256(p.strip().encode()).hexdigest()
-    for p in _AUTH_PASSWORDS_RAW.split(",")
-    if p.strip()
-) if _AUTH_PASSWORDS_RAW.strip() else set()
 
-if _AUTH_ENABLED and not _AUTH_TOKENS:
-    print("⚠️  WEB_AUTH_ENABLED=true 但未設定 WEB_AUTH_PASSWORDS，密碼保護不會生效")
-    _AUTH_ENABLED = False
+def _mask_secret(val: str, keep_start: int = 3, keep_end: int = 3) -> str:
+    """敏感字串脫敏顯示，保護金鑰不洩露。"""
+    if not val:
+        return ""
+    val = val.strip()
+    if len(val) <= keep_start + keep_end:
+        return f"{val[:1]}***{val[-1:]}" if len(val) > 2 else "***"
+    return f"{val[:keep_start]}****{val[-keep_end:]}"
+
+
+def reload_system_env(override: bool = False):
+    """載入環境變數並刷新核心常數與認證權杖。
+    優先順序：系統環境變數 > 專案根目錄 .env > Skill 目錄 .env > 當前目錄 .env
+    """
+    global _AUTH_ENABLED, _AUTH_PASSWORDS_RAW, _AUTH_TOKENS
+    load_env(override=override)
+
+    for _p in [_PROJECT_ROOT / '.env', _SKILL_ENV_DIR / '.env', Path.cwd() / '.env']:
+        if _p.exists():
+            try:
+                with open(str(_p), encoding='utf-8') as _f:
+                    for _line in _f:
+                        _line = _line.strip()
+                        if not _line or _line.startswith('#') or '=' not in _line:
+                            continue
+                        _key, _val = _line.split('=', 1)
+                        _key, _val = _key.strip(), _val.strip().strip('"\'')
+                        if _key:
+                            if override:
+                                os.environ[_key] = _val
+                            else:
+                                os.environ.setdefault(_key, _val)
+            except OSError:
+                pass
+
+    _AUTH_ENABLED = os.getenv("WEB_AUTH_ENABLED", "").lower() in ("1", "true", "yes")
+    _AUTH_PASSWORDS_RAW = os.getenv("WEB_AUTH_PASSWORDS", "")
+    _AUTH_TOKENS = set(
+        hashlib.sha256(p.strip().encode()).hexdigest()
+        for p in _AUTH_PASSWORDS_RAW.split(",")
+        if p.strip()
+    ) if _AUTH_PASSWORDS_RAW.strip() else set()
+
+    if _AUTH_ENABLED and not _AUTH_TOKENS:
+        print("⚠️  WEB_AUTH_ENABLED=true 但未設定 WEB_AUTH_PASSWORDS，密碼保護不會生效")
+        _AUTH_ENABLED = False
+
+
+# 初始化全域環境變數
+reload_system_env(override=False)
+
+
+def get_system_config() -> dict:
+    """彙整並脫敏當前系統所有環境變數、路徑與運行參數。"""
+    import tdm_core
+
+    env_files = [
+        {
+            "priority": 1,
+            "name": "系統環境變數 (Shell / export / set)",
+            "path": "os.environ",
+            "exists": True,
+            "status": "最高優先級",
+            "mtime": "-"
+        },
+        {
+            "priority": 2,
+            "name": "專案根目錄 .env (推薦)",
+            "path": str(_PROJECT_ROOT / ".env"),
+            "exists": (_PROJECT_ROOT / ".env").exists(),
+            "status": "已載入" if (_PROJECT_ROOT / ".env").exists() else "未建立",
+            "mtime": datetime.fromtimestamp((_PROJECT_ROOT / ".env").stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S") if (_PROJECT_ROOT / ".env").exists() else "-"
+        },
+        {
+            "priority": 3,
+            "name": "Skill 目錄 .env (向下相容)",
+            "path": str(_SKILL_ENV_DIR / ".env"),
+            "exists": (_SKILL_ENV_DIR / ".env").exists(),
+            "status": "已載入" if (_SKILL_ENV_DIR / ".env").exists() else "未建立",
+            "mtime": datetime.fromtimestamp((_SKILL_ENV_DIR / ".env").stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S") if (_SKILL_ENV_DIR / ".env").exists() else "-"
+        },
+        {
+            "priority": 4,
+            "name": "當前目錄 .env (防禦保底)",
+            "path": str(Path.cwd() / ".env"),
+            "exists": (Path.cwd() / ".env").exists(),
+            "status": "已載入" if (Path.cwd() / ".env").exists() else "未建立",
+            "mtime": datetime.fromtimestamp((Path.cwd() / ".env").stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S") if (Path.cwd() / ".env").exists() else "-"
+        },
+        {
+            "priority": "-",
+            "name": "專案根目錄 .env.example",
+            "path": str(_PROJECT_ROOT / ".env.example"),
+            "exists": (_PROJECT_ROOT / ".env.example").exists(),
+            "status": "存在範本" if (_PROJECT_ROOT / ".env.example").exists() else "缺失",
+            "mtime": datetime.fromtimestamp((_PROJECT_ROOT / ".env.example").stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S") if (_PROJECT_ROOT / ".env.example").exists() else "-"
+        }
+    ]
+
+    dl_dir = tdm_core.DOWNLOAD_DIR
+    dl_count = len(list(dl_dir.glob("*.mp4"))) + len(list(dl_dir.glob("*.mkv"))) if dl_dir.exists() else 0
+    db_file = tdm_core.DB_PATH
+    db_size = f"{db_file.stat().st_size / 1024:.1f} KB" if db_file.exists() else "0 KB"
+
+    paths_info = {
+        "project_root": str(_PROJECT_ROOT),
+        "download_dir": str(dl_dir),
+        "download_dir_raw": os.getenv("TDM_DOWNLOAD_DIR", "(預設: downloads)"),
+        "download_dir_exists": dl_dir.exists(),
+        "download_video_count": dl_count,
+        "db_path": str(db_file),
+        "db_path_raw": os.getenv("TDM_DB_PATH", "(預設: .claude/skills/tdm/scripts/tdm_news.db)"),
+        "db_exists": db_file.exists(),
+        "db_size": db_size,
+    }
+
+    passwords_cnt = len([p for p in _AUTH_PASSWORDS_RAW.split(",") if p.strip()])
+    auth_info = {
+        "enabled": _AUTH_ENABLED,
+        "raw_enabled": os.getenv("WEB_AUTH_ENABLED", "false"),
+        "passwords_configured": passwords_cnt > 0,
+        "passwords_count": passwords_cnt,
+        "tokens_count": len(_AUTH_TOKENS),
+        "status_text": f"已啟用 (保護中，已載入 {passwords_cnt} 組授權密碼)" if _AUTH_ENABLED else "未啟用 (公開訪問模式)"
+    }
+
+    remote_server = os.getenv("TDM_SERVER", "").strip()
+    remote_info = {
+        "server_url": remote_server or "未設定（本地模式）",
+        "is_remote_client": bool(remote_server),
+        "server_password_set": bool(os.getenv("TDM_SERVER_PASSWORD", "").strip()),
+        "poll_timeout": os.getenv("TDM_REMOTE_POLL_TIMEOUT", "600") + " 秒",
+    }
+
+    webdav_pw = os.getenv("WEBDAV_PASSWORD", "").strip()
+    webdav_info = {
+        "enabled": os.getenv("WEBDAV_ENABLED", "").lower() in ("1", "true", "yes"),
+        "url": os.getenv("WEBDAV_URL", "未設定"),
+        "username": os.getenv("WEBDAV_USERNAME", "未設定"),
+        "password_configured": bool(webdav_pw),
+        "path": os.getenv("WEBDAV_PATH", "未設定"),
+        "is_configured": is_webdav_configured(),
+        "status_text": "已就緒" if is_webdav_configured() else ("已啟用但配置不完整" if os.getenv("WEBDAV_ENABLED", "").lower() in ("1", "true", "yes") else "未啟用")
+    }
+
+    tg_token = os.getenv("TG_TOKEN", "").strip()
+    tg_chatid = os.getenv("TG_CHATID", "").strip()
+    push_info = {
+        "enabled": os.getenv("PUSH_ENABLED", "").lower() in ("1", "true", "yes"),
+        "default_target": os.getenv("PUSH_DEFAULT_TARGET", "tg"),
+        "tg_token_configured": bool(tg_token),
+        "tg_token_masked": _mask_secret(tg_token, 6, 4) if tg_token else "未設定",
+        "tg_chatid_configured": bool(tg_chatid),
+        "tg_chatid_masked": _mask_secret(tg_chatid, 3, 3) if tg_chatid else "未設定",
+        "is_available": is_push_available(),
+        "status_text": "可用 (可推播文字/影片)" if is_push_available() else "不可用 (請檢查 PUSH_ENABLED 或 Token/ChatID)"
+    }
+
+    runtime_info = {
+        "python_version": sys.version.split()[0],
+        "platform": sys.platform,
+        "ffmpeg_available": bool(tdm_core._HAS_FFMPEG),
+        "ytdlp_available": bool(tdm_core._HAS_YTDLP),
+        "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    return {
+        "ok": True,
+        "env_files": env_files,
+        "paths": paths_info,
+        "auth": auth_info,
+        "remote": remote_info,
+        "webdav": webdav_info,
+        "push": push_info,
+        "runtime": runtime_info
+    }
 
 
 HTML = r"""<!DOCTYPE html>
@@ -109,6 +267,17 @@ button:disabled{background:#333;color:#666;cursor:not-allowed}
 .btn-danger{border-color:#f55;color:#f55}.btn-danger:hover{background:#3d1a1a}
 .badge{font-size:.7rem;padding:.15rem .4rem;border-radius:4px;white-space:nowrap;font-weight:600;display:inline-block}
 .badge-vid{background:#1b4332;color:#95d5b2}.badge-txt{background:#0d419d;color:#c9d1d9}.badge-chk{background:#5c4200;color:#ffc107}.badge-cut{background:#3d2e00;color:#f0c040}
+.badge-ok{background:#1b4332;color:#95d5b2}.badge-no{background:#3d1a1a;color:#f5a5a5}.badge-pri{background:#16243b;color:#58a6ff;border:1px solid #388bfd44}
+.config-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:1rem;margin-top:.75rem}
+.config-box{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:1rem}
+.config-box h3{font-size:.9rem;color:var(--accent);margin-bottom:.75rem;display:flex;align-items:center;justify-content:space-between}
+.config-row{display:flex;justify-content:space-between;align-items:center;padding:.45rem 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:.82rem}
+.config-row:last-child{border-bottom:none}
+.config-k{color:var(--dim);white-space:nowrap;margin-right:.5rem}
+.config-v{color:var(--fg);word-break:break-all;text-align:right;font-family:Consolas,monospace;font-size:.8rem}
+.config-table{width:100%;border-collapse:collapse;font-size:.8rem;margin-top:.5rem}
+.config-table th,.config-table td{padding:.45rem .6rem;border:1px solid var(--border);text-align:left}
+.config-table th{background:rgba(255,255,255,.04);color:var(--dim);font-weight:600}
 .push-tg-btn{background:#0088cc;color:#fff;border-color:#0088cc}
 .push-tg-btn:hover{background:#0099dd}
 #toast{position:fixed;top:1rem;right:1rem;z-index:9999;max-width:420px;padding:.75rem 1rem;border-radius:8px;font-size:.85rem;font-weight:600;display:none;box-shadow:0 4px 24px rgba(0,0,0,.5)}
@@ -188,6 +357,7 @@ label.check-label input[type=checkbox]{flex:none;width:auto}
     <button class="active" onclick="switchTab('news')">📰 新聞</button>
     <button onclick="switchTab('download')">⬇️ 下載</button>
     <button onclick="switchTab('videos')">📁 已下載</button>
+    <button onclick="switchTab('config')">⚙️ 系統參數</button>
   </nav>
 </header>
 
@@ -289,6 +459,164 @@ label.check-label input[type=checkbox]{flex:none;width:auto}
     <div id="video-list"><div class="loading">載入中...</div></div>
   </div>
 </div>
+
+<!-- ═══ 系統參數 ═══ -->
+<div id="tab-config" class="tab">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem">
+      <h2>⚙️ 系統運行環境與環境變數參數</h2>
+      <div style="display:flex;gap:.5rem">
+        <button class="btn-sm btn-outline" onclick="loadConfig()">🔄 重新整理</button>
+        <button class="btn-sm" onclick="reloadConfig()">⚡ 重新載入 .env 設定</button>
+      </div>
+    </div>
+    <div style="color:var(--dim);font-size:.8rem;margin-top:.25rem">
+      集中檢視專案目前載入之 .env 配置、目錄路徑與服務狀態（敏感憑據已安全掩碼脫敏）。
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>📄 環境變數載入鏈（優先順序由上至下）</h2>
+    <div style="overflow-x:auto">
+      <table class="config-table" id="cfg-env-table">
+        <thead>
+          <tr>
+            <th style="width:60px">優先級</th>
+            <th>來源名稱</th>
+            <th>實際檔案路徑</th>
+            <th style="width:90px">狀態</th>
+            <th style="width:160px">最後修改時間</th>
+          </tr>
+        </thead>
+        <tbody id="cfg-env-tbody">
+          <tr><td colspan="5" class="loading">載入中...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="config-grid">
+    <!-- 儲存與路徑 -->
+    <div class="config-box">
+      <h3>📁 儲存與路徑配置 <span class="badge badge-pri">Paths</span></h3>
+      <div class="config-row">
+        <span class="config-k">專案根目錄</span>
+        <span class="config-v" id="cfg-proj-root">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">TDM_DOWNLOAD_DIR (原始)</span>
+        <span class="config-v" id="cfg-dl-raw">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">影片儲存實體絕對路徑</span>
+        <span class="config-v" id="cfg-dl-path">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">已下載影片檔數量</span>
+        <span class="config-v" id="cfg-dl-count">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">TDM_DB_PATH (原始)</span>
+        <span class="config-v" id="cfg-db-raw">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">SQLite 資料庫實體路徑</span>
+        <span class="config-v" id="cfg-db-path">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">資料庫大小 / 狀態</span>
+        <span class="config-v" id="cfg-db-size">-</span>
+      </div>
+    </div>
+
+    <!-- Web 安全與遠端模式 -->
+    <div class="config-box">
+      <h3>🔐 Web 安全與遠端模式 <span class="badge badge-pri">Security & Remote</span></h3>
+      <div class="config-row">
+        <span class="config-k">WEB_AUTH_ENABLED</span>
+        <span class="config-v" id="cfg-auth-status">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">WEB_AUTH_PASSWORDS</span>
+        <span class="config-v" id="cfg-auth-pwd-cnt">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">TDM_SERVER (遠端伺服器)</span>
+        <span class="config-v" id="cfg-remote-url">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">TDM_SERVER_PASSWORD</span>
+        <span class="config-v" id="cfg-remote-pwd">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">TDM_REMOTE_POLL_TIMEOUT</span>
+        <span class="config-v" id="cfg-remote-timeout">-</span>
+      </div>
+    </div>
+
+    <!-- 推送通道 -->
+    <div class="config-box">
+      <h3>🚀 消息與檔案推送通道 <span class="badge badge-pri">Push Channels</span></h3>
+      <div class="config-row">
+        <span class="config-k">WEBDAV_ENABLED</span>
+        <span class="config-v" id="cfg-webdav-status">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">WEBDAV_URL</span>
+        <span class="config-v" id="cfg-webdav-url">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">WEBDAV_PATH</span>
+        <span class="config-v" id="cfg-webdav-path">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">PUSH_ENABLED (通用推送)</span>
+        <span class="config-v" id="cfg-push-status">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">PUSH_DEFAULT_TARGET</span>
+        <span class="config-v" id="cfg-push-target">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">TG_TOKEN</span>
+        <span class="config-v" id="cfg-tg-token">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">TG_CHATID</span>
+        <span class="config-v" id="cfg-tg-chatid">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">Telegram 通道可用性</span>
+        <span class="config-v" id="cfg-tg-avail">-</span>
+      </div>
+    </div>
+
+    <!-- 運行時環境與外部工具 -->
+    <div class="config-box">
+      <h3>🛠️ 運行環境與外部依賴 <span class="badge badge-pri">Environment</span></h3>
+      <div class="config-row">
+        <span class="config-k">Python 版本</span>
+        <span class="config-v" id="cfg-py-ver">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">作業系統平台</span>
+        <span class="config-v" id="cfg-platform">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">ffmpeg 影片編解碼工具</span>
+        <span class="config-v" id="cfg-ffmpeg">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">yt-dlp 下載器模組</span>
+        <span class="config-v" id="cfg-ytdlp">-</span>
+      </div>
+      <div class="config-row">
+        <span class="config-k">伺服器目前時間</span>
+        <span class="config-v" id="cfg-srv-time">-</span>
+      </div>
+    </div>
+  </div>
+</div>
 </main>
 
 <script>
@@ -305,11 +633,12 @@ let newsPage=1,newsTotal=0,dlTimer=null,searchKW='',currentVideoInfo=null,active
 function switchTab(t){
   document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active'));
   document.querySelectorAll('nav button').forEach((e,i)=>{
-    e.classList.toggle('active',(t==='news'&&i===0)||(t==='download'&&i===1)||(t==='videos'&&i===2));
+    e.classList.toggle('active',(t==='news'&&i===0)||(t==='download'&&i===1)||(t==='videos'&&i===2)||(t==='config'&&i===3));
   });
   S('tab-'+t).classList.add('active');
   if(t==='news') loadNews(1);
   else if(t==='videos') loadVideos();
+  else if(t==='config') loadConfig();
 }
 
 // ── URL 參數 ──
@@ -726,6 +1055,89 @@ document.addEventListener('click',function(e){
   }
 });
 
+// ── 系統參數配置 ──
+async function loadConfig(){
+  try{
+    const r=await fetch('/api/config');
+    const d=await r.json();
+    if(!d.ok){showToast(d.error||'載入系統參數失敗','err');return;}
+    renderConfig(d);
+  }catch(e){
+    showToast('網路異常，無法載入配置: '+e.message,'err');
+  }
+}
+
+async function reloadConfig(){
+  try{
+    showToast('正在重新載入 .env 與全域設定...','info');
+    const r=await fetch('/api/config/reload',{method:'POST'});
+    const d=await r.json();
+    if(d.ok){
+      showToast(d.message||'重新載入成功','ok');
+      if(d.config) renderConfig(d.config);
+      else loadConfig();
+    }else{
+      showToast(d.error||'重新載入失敗','err');
+    }
+  }catch(e){
+    showToast('請求異常: '+e.message,'err');
+  }
+}
+
+function renderConfig(d){
+  // 1. 環境變數檔案列表
+  const tbody=S('cfg-env-tbody');
+  if(tbody&&d.env_files&&d.env_files.length){
+    tbody.innerHTML=d.env_files.map(f=>{
+      const badge=f.exists?'<span class="badge badge-ok">已生效/存在</span>':'<span class="badge badge-no">未建立/不存在</span>';
+      return `<tr>
+        <td style="font-weight:600;color:var(--accent)">#${f.priority}</td>
+        <td style="font-weight:600">${f.name}</td>
+        <td><code style="cursor:pointer;color:#58a6ff;font-size:.78rem" onclick="copyText('${f.path.replace(/\\/g,'\\\\')}','路徑')" title="點擊複製">${f.path}</code></td>
+        <td>${badge}</td>
+        <td style="color:var(--dim);font-size:.75rem">${f.mtime}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  // 2. 儲存路徑
+  const p=d.paths||{};
+  if(S('cfg-proj-root')) S('cfg-proj-root').innerHTML=`<code style="cursor:pointer;color:#58a6ff" onclick="copyText('${(p.project_root||'').replace(/\\/g,'\\\\')}','專案根')" title="點擊複製">${p.project_root||'-'}</code>`;
+  if(S('cfg-dl-raw')) S('cfg-dl-raw').textContent=p.download_dir_raw||'-';
+  if(S('cfg-dl-path')) S('cfg-dl-path').innerHTML=`<code style="cursor:pointer;color:#58a6ff" onclick="copyText('${(p.download_dir||'').replace(/\\/g,'\\\\')}','下載目錄')" title="點擊複製">${p.download_dir||'-'}</code> ${p.download_dir_exists?'<span class="badge badge-ok">目錄存在</span>':'<span class="badge badge-no">未建立</span>'}`;
+  if(S('cfg-dl-count')) S('cfg-dl-count').textContent=(p.download_video_count!=null?p.download_video_count:0)+' 個檔案';
+  if(S('cfg-db-raw')) S('cfg-db-raw').textContent=p.db_path_raw||'-';
+  if(S('cfg-db-path')) S('cfg-db-path').innerHTML=`<code style="cursor:pointer;color:#58a6ff" onclick="copyText('${(p.db_path||'').replace(/\\/g,'\\\\')}','資料庫路徑')" title="點擊複製">${p.db_path||'-'}</code>`;
+  if(S('cfg-db-size')) S('cfg-db-size').innerHTML=`${p.db_size||'0 KB'} ${p.db_exists?'<span class="badge badge-ok">正常</span>':'<span class="badge badge-no">不存在</span>'}`;
+
+  // 3. Web 安全與遠端
+  const a=d.auth||{}, rm=d.remote||{};
+  if(S('cfg-auth-status')) S('cfg-auth-status').innerHTML=a.enabled?'<span class="badge badge-ok">已啟用密碼保護</span>':'<span class="badge badge-no">未啟用（公開）</span>';
+  if(S('cfg-auth-pwd-cnt')) S('cfg-auth-pwd-cnt').textContent=a.status_text||'-';
+  if(S('cfg-remote-url')) S('cfg-remote-url').textContent=rm.server_url||'未設定（本地模式）';
+  if(S('cfg-remote-pwd')) S('cfg-remote-pwd').textContent=rm.server_password_set?'已設定 (已遮蔽)':'未設定';
+  if(S('cfg-remote-timeout')) S('cfg-remote-timeout').textContent=rm.poll_timeout||'-';
+
+  // 4. 推送
+  const wd=d.webdav||{}, ps=d.push||{};
+  if(S('cfg-webdav-status')) S('cfg-webdav-status').innerHTML=wd.enabled?'<span class="badge badge-ok">啟用</span>':'<span class="badge badge-no">關閉</span>';
+  if(S('cfg-webdav-url')) S('cfg-webdav-url').textContent=wd.url||'未設定';
+  if(S('cfg-webdav-path')) S('cfg-webdav-path').textContent=wd.path||'未設定';
+  if(S('cfg-push-status')) S('cfg-push-status').innerHTML=ps.enabled?'<span class="badge badge-ok">啟用</span>':'<span class="badge badge-no">關閉</span>';
+  if(S('cfg-push-target')) S('cfg-push-target').textContent=ps.default_target||'-';
+  if(S('cfg-tg-token')) S('cfg-tg-token').textContent=ps.tg_token_masked||'未設定';
+  if(S('cfg-tg-chatid')) S('cfg-tg-chatid').textContent=ps.tg_chatid_masked||'未設定';
+  if(S('cfg-tg-avail')) S('cfg-tg-avail').innerHTML=ps.is_available?'<span class="badge badge-ok">可正常推播</span>':'<span class="badge badge-no">未就緒</span>';
+
+  // 5. 運行時環境
+  const rt=d.runtime||{};
+  if(S('cfg-py-ver')) S('cfg-py-ver').textContent=rt.python_version||'-';
+  if(S('cfg-platform')) S('cfg-platform').textContent=rt.platform||'-';
+  if(S('cfg-ffmpeg')) S('cfg-ffmpeg').innerHTML=rt.ffmpeg_available?'<span class="badge badge-ok">已就緒 (可轉檔/裁剪)</span>':'<span class="badge badge-no">未安裝/不在 PATH</span>';
+  if(S('cfg-ytdlp')) S('cfg-ytdlp').innerHTML=rt.ytdlp_available?'<span class="badge badge-ok">已安裝</span>':'<span class="badge badge-chk">未安裝 (降級使用 ffmpeg)</span>';
+  if(S('cfg-srv-time')) S('cfg-srv-time').textContent=rt.server_time||'-';
+}
+
 // ── 共用 ──
 function fmtCut(cs,ce){
   if(cs==null&&ce==null)return'';
@@ -735,14 +1147,15 @@ function fmtCut(cs,ce){
 function fmtSize(b){if(!b||b===0)return'';const kb=b/1024;return kb>=1024?`${(kb/1024).toFixed(1)} MB`:`${kb.toFixed(0)} KB`;}
 // ── 初始化 ──
 (function(){
+  const tab=getParam('tab');
   const news_id=getParam('news_id');
   const vid=getParam('vid');
-  if(news_id){
+  if(tab==='config'){
+    switchTab('config');
+  }else if(news_id){
     switchTab('download');
     S('dl-input').value=news_id;
-    // 查詢新聞資訊
     queryVideo();
-    // 若指定了 vid，自動播放
     if(vid) setTimeout(()=>openVideo(parseInt(vid),news_id),300);
   }else{
     loadNews(1);
@@ -1450,6 +1863,28 @@ def api_auth_logout():
     resp = jsonify({"ok": True})
     resp.delete_cookie("tdmdo_auth", path="/")
     return resp
+
+
+# ═══ 系統配置與環境變數路由 ═══
+
+@app.route("/api/config")
+def api_get_config():
+    """取得當前生效的系統環境變數、路徑與功能配置（敏感資訊自動脫敏）。"""
+    return jsonify(get_system_config())
+
+
+@app.route("/api/config/reload", methods=["POST"])
+def api_reload_config():
+    """重新載入 .env 檔案與系統參數配置。"""
+    try:
+        reload_system_env(override=True)
+        return jsonify({
+            "ok": True,
+            "message": "系統環境變數與路徑已成功重新載入！",
+            "config": get_system_config(),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"重新載入失敗: {e}"}), 500
 
 
 # ─── main ─────────────────────────────────────────────────
