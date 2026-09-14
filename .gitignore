@@ -35,6 +35,8 @@ Thumbs.db
 .claude/settings.local.json
 .claude/worktrees/
 .claude/skills/*/.env
+# ---- 下載與媒體檔案 ----
+downloads/
 .claude/skills/*/downloads/
 
 # ---- 跨代理 Skill 聯接（本機 junction，實際檔案在 .claude/skills）----
